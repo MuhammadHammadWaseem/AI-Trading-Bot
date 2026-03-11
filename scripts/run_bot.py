@@ -1,12 +1,9 @@
 """
-scripts/run_bot.py
--------------------
-Main entry point.
+scripts/run_bot.py — Main entry point.
 
 Usage:
     python scripts/run_bot.py
-    python scripts/run_bot.py --pairs BTCUSDT ETHUSDT
-    python scripts/run_bot.py --leverage 10 --tp 2.0 --sl 1.0
+    python scripts/run_bot.py --pairs BTCUSDT ETHUSDT --leverage 10 --tp 2.0 --sl 1.0
     python scripts/run_bot.py --train
 """
 
@@ -23,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.exchange.exchange_factory import create_exchange
 from core.risk.risk_manager import RiskManager
 from core.strategy.recovery_strategy import RecoveryStrategy
-from core.trader.futures_trader import FuturesTrader
+from core.trader.futures_trader import FuturesTrader, _normalize_symbol
 from config.settings import settings, RiskSettings
 from config.logger import get_logger
 from rich.console import Console
@@ -39,7 +36,7 @@ _running = True
 
 def signal_handler(sig, frame):
     global _running
-    console.print("\n[bold yellow]Shutdown signal — stopping...[/]")
+    console.print("\n[bold yellow]Stopping bot...[/]")
     _running = False
     for t in _traders:
         t.stop()
@@ -53,47 +50,64 @@ async def print_dashboard(exchange, traders: List[FuturesTrader]):
         balance   = await exchange.get_balance()
         positions = await exchange.get_open_positions()
 
+        # Build position lookup by normalized symbol
+        pos_map = {}
+        for p in positions:
+            pos_map[_normalize_symbol(p.symbol)] = p
+
         table = Table(
             title=f"AI Trading Bot — {datetime.now().strftime('%H:%M:%S')}",
             box=box.ROUNDED, border_style="cyan",
         )
-        table.add_column("Symbol",      style="bold white")
-        table.add_column("Cycles",      justify="right")
-        table.add_column("ML",          justify="center")
-        table.add_column("Position",    justify="center")
-        table.add_column("TP / SL")
-        table.add_column("PnL",         justify="right")
+        table.add_column("Symbol",   style="bold white")
+        table.add_column("Cycles",   justify="right")
+        table.add_column("ML",       justify="center")
+        table.add_column("Side",     justify="center")
+        table.add_column("Entry",    justify="right")
+        table.add_column("TP / SL",  justify="center")
+        table.add_column("PnL",      justify="right")
 
         for t in traders:
             stats = t.get_stats()
-            pos   = next((p for p in positions if p.symbol == t.symbol), None)
+            pos   = pos_map.get(_normalize_symbol(t.symbol))
 
             if pos:
-                side_str = f"[green]LONG[/]" if pos.side.value == "long" else f"[red]SHORT[/]"
-                pnl_val  = pos.unrealized_pnl
-                pnl_str  = f"[green]{pnl_val:+.4f}[/]" if pnl_val >= 0 else f"[red]{pnl_val:+.4f}[/]"
-                tp_sl    = f"{stats['tp']:.2f} / {stats['sl']:.2f}" if stats["tp"] else "—"
+                side_str  = "[green]LONG[/]"  if pos.side.value == "long" else "[red]SHORT[/]"
+                entry_str = f"{pos.entry_price:.2f}"
+                pnl_val   = pos.unrealized_pnl
+                pnl_str   = f"[green]+{pnl_val:.4f}[/]" if pnl_val >= 0 else f"[red]{pnl_val:.4f}[/]"
+                tp_sl_str = (f"{stats['tp']:.2f} / {stats['sl']:.2f}"
+                             if stats["tp"] else "monitoring...")
             else:
-                side_str = "[dim]Watching[/]"
-                pnl_str  = "—"
-                tp_sl    = "—"
+                side_str  = "[dim]Watching[/]"
+                entry_str = "—"
+                pnl_str   = "—"
+                tp_sl_str = "—"
 
             table.add_row(
                 stats["symbol"],
                 str(stats["cycles"]),
-                "[green]YES[/]" if stats["ml_trained"] else "[dim]NO[/]",
+                "[green]YES[/]" if stats["ml_trained"] else "[yellow]NO[/]",
                 side_str,
-                tp_sl,
+                entry_str,
+                tp_sl_str,
                 pnl_str,
             )
 
         console.print(table)
-        bal_color = "green" if balance.unrealized_pnl >= 0 else "red"
+
+        pnl_color = "green" if balance.unrealized_pnl >= 0 else "red"
+        start_bal = 5000.0
+        total_pnl = balance.total_balance - start_bal
+        total_color = "green" if total_pnl >= 0 else "red"
+
         console.print(
             f"  Balance: [bold green]{balance.total_balance:.2f} USDT[/]  |  "
             f"Available: [cyan]{balance.available_balance:.2f} USDT[/]  |  "
-            f"Floating PnL: [{bal_color}]{balance.unrealized_pnl:+.4f} USDT[/]"
+            f"Floating: [{pnl_color}]{balance.unrealized_pnl:+.4f} USDT[/]  |  "
+            f"Session PnL: [{total_color}]{total_pnl:+.2f} USDT[/]"
         )
+
     except Exception as e:
         logger.warning(f"Dashboard error: {e}")
 
@@ -110,7 +124,7 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct, interval):
     exchange  = create_exchange("binance")
     connected = await exchange.connect()
     if not connected:
-        console.print("[bold red]Exchange connection failed — check .env API keys[/]")
+        console.print("[bold red]Connection failed — check .env[/]")
         return
 
     risk_settings = RiskSettings(
@@ -137,7 +151,6 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct, interval):
         logger.info(f"Trader ready: {symbol}")
 
     if train:
-        console.print("[bold yellow]Training ML models...[/]")
         for trader in _traders:
             try:
                 await trader.train_ml_model(candle_limit=1000)
@@ -149,7 +162,7 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct, interval):
     while _running:
         try:
             await asyncio.gather(
-                *[trader.run_cycle() for trader in _traders],
+                *[t.run_cycle() for t in _traders],
                 return_exceptions=True
             )
             await print_dashboard(exchange, _traders)
@@ -163,13 +176,13 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct, interval):
             logger.error(f"Main loop error: {e}", exc_info=True)
             await asyncio.sleep(5)
 
-    console.print("[bold yellow]Closing connection...[/]")
+    console.print("[bold yellow]Closing...[/]")
     await exchange._exchange.close()
-    console.print("[bold green]Bot stopped cleanly.[/]")
+    console.print("[bold green]Bot stopped.[/]")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="AI Futures Trading Bot")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--pairs",    nargs="+", default=settings.trading_pairs)
     parser.add_argument("--train",    action="store_true")
     parser.add_argument("--leverage", type=int,   default=settings.risk.leverage)

@@ -1,8 +1,8 @@
 """
 core/trader/futures_trader.py
 ------------------------------
-Main trading orchestrator for a single symbol.
-TP/SL monitored manually each cycle (Testnet compatible).
+Main trading orchestrator. 
+Fixed: symbol format matching, TP/SL monitoring, position display.
 """
 
 import asyncio
@@ -19,17 +19,16 @@ from config.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _normalize_symbol(symbol: str) -> str:
+    """Normalize symbol — remove /: separators for comparison."""
+    return symbol.replace("/", "").replace(":USDT", "").replace(":BTC", "").upper()
+
+
 class FuturesTrader:
 
     TIMEFRAME = "15m"
 
-    def __init__(
-        self,
-        exchange:          BaseExchange,
-        symbol:            str,
-        risk_manager:      RiskManager,
-        recovery_strategy: RecoveryStrategy,
-    ):
+    def __init__(self, exchange, symbol, risk_manager, recovery_strategy):
         self.exchange   = exchange
         self.symbol     = symbol
         self.risk       = risk_manager
@@ -40,11 +39,18 @@ class FuturesTrader:
         self._cycles        = 0
         self._trades_opened = 0
         self._in_position   = False
-
-        # TP/SL tracked locally (Testnet workaround)
         self._tp_price: Optional[float] = None
         self._sl_price: Optional[float] = None
         self._position_side: Optional[OrderSide] = None
+        self._entry_price: Optional[float] = None
+
+    def _find_my_position(self, positions):
+        """Find position matching this symbol — handles different format variants."""
+        my_sym = _normalize_symbol(self.symbol)
+        for p in positions:
+            if _normalize_symbol(p.symbol) == my_sym:
+                return p
+        return None
 
     async def run_cycle(self):
         if not self._is_active:
@@ -54,7 +60,7 @@ class FuturesTrader:
         logger.info(f"Cycle #{self._cycles} — {self.symbol}")
 
         try:
-            # Step 1: Fetch & prepare data
+            # Fetch market data
             candles = await self.exchange.get_ohlcv(self.symbol, self.TIMEFRAME, limit=300)
             if not candles or len(candles) < 50:
                 logger.warning(f"Insufficient candles for {self.symbol}")
@@ -64,133 +70,108 @@ class FuturesTrader:
             df            = add_all_indicators(df)
             current_price = float(df["close"].iloc[-1])
 
-            # Step 2: Check existing position on exchange
+            # Check existing position
             positions    = await self.exchange.get_open_positions()
-            current_pos  = next((p for p in positions if p.symbol == self.symbol), None)
+            current_pos  = self._find_my_position(positions)
 
             if current_pos:
                 self._in_position = True
                 await self._monitor_tpsl(current_pos, current_price)
-                return  # Already in position — skip entry logic
+                return
 
-            # Position was just closed externally (TP/SL hit on exchange side)
+            # Position was closed
             if self._in_position:
-                logger.info(f"[CLOSED] {self.symbol} position closed — ready for next")
+                logger.info(f"[CLOSED] {self.symbol} position closed — ready for next trade")
                 self._reset_position_state()
 
-            # Step 3: Get AI prediction
+            # Get AI prediction
             prediction = self.model.predict(df)
             logger.info(
                 f"[SIGNAL] {self.symbol} -> {prediction.signal.value} | "
                 f"conf={prediction.confidence:.0%} | {prediction.source}"
             )
 
-            # Step 4: Filter weak signals
             if prediction.signal == Signal.HOLD:
                 logger.info(f"[HOLD] {self.symbol} — skipping cycle")
                 return
 
             if prediction.confidence < 0.65:
-                logger.info(
-                    f"[SKIP] {self.symbol} — confidence {prediction.confidence:.0%} "
-                    f"too low (need 65%+)"
-                )
+                logger.info(f"[SKIP] {self.symbol} — conf {prediction.confidence:.0%} < 65%")
                 return
 
-            # Step 5: Side
             side = OrderSide.LONG if prediction.signal == Signal.LONG else OrderSide.SHORT
 
-            # Step 6: Risk check
             balance    = await self.exchange.get_balance()
             total_open = len(positions)
 
             if self.risk.is_daily_limit_hit(balance):
-                logger.warning(f"[DAILY LIMIT] Trading stopped for today")
+                logger.warning(f"[DAILY LIMIT] {self.symbol} — trading paused")
                 return
 
             trade_params = self.risk.calculate_trade(
-                symbol=self.symbol,
-                side=side,
+                symbol=self.symbol, side=side,
                 entry_price=current_price,
-                balance=balance,
-                open_trades=total_open,
+                balance=balance, open_trades=total_open,
             )
 
             if not trade_params.approved:
                 logger.warning(f"[REJECTED] {self.symbol} — {trade_params.reject_reason}")
                 return
 
-            # Step 7: Recovery size multiplier
             if self.recovery.is_in_recovery(self.symbol):
                 if self.recovery.should_open_recovery(self.symbol, prediction):
                     mult = self.recovery.get_recovery_size_multiplier(self.symbol)
                     trade_params.quantity = round(trade_params.quantity * mult, 3)
                     logger.info(f"[RECOVERY] {self.symbol} size x{mult:.1f}")
                 else:
-                    logger.info(f"[RECOVERY WAIT] {self.symbol} — signal not strong enough")
+                    logger.info(f"[RECOVERY WAIT] {self.symbol}")
                     return
 
-            # Step 8: Execute trade
             await self._execute_trade(trade_params)
 
         except Exception as e:
             logger.error(f"Cycle error {self.symbol}: {e}", exc_info=True)
 
     async def _monitor_tpsl(self, pos: PositionInfo, current_price: float):
-        """
-        Manually monitor TP/SL since Testnet does not support
-        TAKE_PROFIT_MARKET / STOP_MARKET order types.
-        On Live exchange these will be native orders instead.
-        """
-        if not self._tp_price or not self._sl_price:
-            pnl_pct = ((current_price - pos.entry_price) / pos.entry_price) * 100
-            if pos.side == OrderSide.SHORT:
-                pnl_pct = -pnl_pct
-            logger.info(
-                f"[WATCHING] {self.symbol} {pos.side.value.upper()} | "
-                f"entry={pos.entry_price:.4f} | now={current_price:.4f} | "
-                f"PnL={pos.unrealized_pnl:+.4f} USDT ({pnl_pct:+.2f}%)"
-            )
-            return
-
-        tp_hit = False
-        sl_hit = False
-
-        if pos.side == OrderSide.LONG:
-            tp_hit = current_price >= self._tp_price
-            sl_hit = current_price <= self._sl_price
-        else:  # SHORT
-            tp_hit = current_price <= self._tp_price
-            sl_hit = current_price >= self._sl_price
-
+        """Monitor TP/SL manually each cycle."""
         pnl_pct = ((current_price - pos.entry_price) / pos.entry_price) * 100
         if pos.side == OrderSide.SHORT:
             pnl_pct = -pnl_pct
 
-        logger.info(
-            f"[WATCHING] {self.symbol} {pos.side.value.upper()} | "
-            f"entry={pos.entry_price:.4f} | now={current_price:.4f} | "
-            f"TP={self._tp_price:.4f} | SL={self._sl_price:.4f} | "
-            f"PnL={pos.unrealized_pnl:+.4f} USDT ({pnl_pct:+.2f}%)"
-        )
+        if self._tp_price and self._sl_price:
+            tp_hit = (current_price >= self._tp_price) if pos.side == OrderSide.LONG else (current_price <= self._tp_price)
+            sl_hit = (current_price <= self._sl_price) if pos.side == OrderSide.LONG else (current_price >= self._sl_price)
 
-        if tp_hit:
-            logger.info(f"[TP HIT] {self.symbol} — closing for PROFIT")
-            result = await self.exchange.close_position(self.symbol)
-            if result.success:
-                self.recovery.record_profit(self.symbol, pos.unrealized_pnl)
-                self.risk.record_profit(pos.unrealized_pnl)
-                logger.info(f"[PROFIT] {self.symbol} closed | PnL={pos.unrealized_pnl:+.4f} USDT")
-            self._reset_position_state()
+            logger.info(
+                f"[WATCHING] {self.symbol} {pos.side.value.upper()} | "
+                f"entry={pos.entry_price:.2f} now={current_price:.2f} | "
+                f"TP={self._tp_price:.2f} SL={self._sl_price:.2f} | "
+                f"PnL={pos.unrealized_pnl:+.4f} USDT ({pnl_pct:+.2f}%)"
+            )
 
-        elif sl_hit:
-            logger.info(f"[SL HIT] {self.symbol} — closing to limit LOSS")
-            result = await self.exchange.close_position(self.symbol)
-            if result.success:
-                self.recovery.record_loss(self.symbol, pos.unrealized_pnl)
-                self.risk.record_loss(pos.unrealized_pnl)
-                logger.info(f"[LOSS] {self.symbol} closed | PnL={pos.unrealized_pnl:+.4f} USDT")
-            self._reset_position_state()
+            if tp_hit:
+                logger.info(f"[TP HIT] {self.symbol} — closing for PROFIT!")
+                result = await self.exchange.close_position(self.symbol)
+                if result.success:
+                    self.recovery.record_profit(self.symbol, pos.unrealized_pnl)
+                    self.risk.record_profit(pos.unrealized_pnl)
+                self._reset_position_state()
+                return
+
+            if sl_hit:
+                logger.info(f"[SL HIT] {self.symbol} — closing to limit LOSS")
+                result = await self.exchange.close_position(self.symbol)
+                if result.success:
+                    self.recovery.record_loss(self.symbol, pos.unrealized_pnl)
+                    self.risk.record_loss(pos.unrealized_pnl)
+                self._reset_position_state()
+                return
+        else:
+            logger.info(
+                f"[WATCHING] {self.symbol} {pos.side.value.upper()} | "
+                f"entry={pos.entry_price:.2f} now={current_price:.2f} | "
+                f"PnL={pos.unrealized_pnl:+.4f} USDT ({pnl_pct:+.2f}%)"
+            )
 
     async def _execute_trade(self, params: TradeParameters):
         if params.side == OrderSide.LONG:
@@ -207,17 +188,17 @@ class FuturesTrader:
             )
 
         if result.success:
-            self._trades_opened  += 1
-            self._in_position    = True
-            self._tp_price       = params.take_profit
-            self._sl_price       = params.stop_loss
-            self._position_side  = params.side
-
+            self._trades_opened += 1
+            self._in_position   = True
+            self._tp_price      = params.take_profit
+            self._sl_price      = params.stop_loss
+            self._position_side = params.side
+            self._entry_price   = result.price
             logger.info(
                 f"[OPENED] #{self._trades_opened} {params.symbol} "
                 f"{params.side.value.upper()} | "
-                f"qty={params.quantity} @ {result.price:.4f} | "
-                f"TP={params.take_profit:.4f} | SL={params.stop_loss:.4f}"
+                f"qty={params.quantity} @ {result.price:.2f} | "
+                f"TP={params.take_profit:.2f} | SL={params.stop_loss:.2f}"
             )
         else:
             logger.error(f"[FAILED] {params.symbol}: {result.message}")
@@ -227,14 +208,13 @@ class FuturesTrader:
         self._tp_price      = None
         self._sl_price      = None
         self._position_side = None
+        self._entry_price   = None
 
     async def train_ml_model(self, candle_limit: int = 1000):
-        logger.info(f"Starting ML training for {self.symbol}...")
         candles = await self.exchange.get_ohlcv(self.symbol, self.TIMEFRAME, limit=candle_limit)
         df = ohlcv_to_dataframe(candles)
         df = add_all_indicators(df)
         self.model.train_ml(df, epochs=50)
-        logger.info(f"ML training complete for {self.symbol}")
 
     def stop(self):
         self._is_active = False
@@ -248,6 +228,7 @@ class FuturesTrader:
             "in_position":   self._in_position,
             "tp":            self._tp_price,
             "sl":            self._sl_price,
+            "entry":         self._entry_price,
             "in_recovery":   self.recovery.is_in_recovery(self.symbol),
             "ml_trained":    self.model.ml_is_trained,
         }
