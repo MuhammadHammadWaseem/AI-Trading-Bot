@@ -1,17 +1,11 @@
 """
-training/trainer.py
-────────────────────
-Standalone ML training script.
-Fetches historical data and trains LSTM models for all configured symbols.
-
-Usage:
-    python training/trainer.py
-    python training/trainer.py --symbols BTCUSDT ETHUSDT --candles 2000
+training/trainer.py — No TensorFlow version.
+Uses scikit-learn ensemble model.
 """
 
-import asyncio
-import argparse
-import sys
+import asyncio, argparse, sys, os
+import numpy as np
+import pandas as pd
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -20,91 +14,53 @@ from core.exchange.exchange_factory import create_exchange
 from core.models.ml_model import MLModel
 from data.indicators import ohlcv_to_dataframe, add_all_indicators
 from config.settings import settings
-from config.logger import get_logger
-from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn
-
-logger  = get_logger(__name__)
-console = Console()
 
 
-async def train_symbol(
-    exchange,
-    symbol:       str,
-    candle_limit: int,
-    timeframe:    str = "15m",
-):
-    """Fetch data and train LSTM for one symbol."""
-    console.print(f"\n  📊 Fetching {candle_limit} candles for [cyan]{symbol}[/]...")
-
-    candles = await exchange.get_ohlcv(symbol, timeframe, limit=candle_limit)
-    if not candles or len(candles) < 200:
-        logger.error(f"Not enough candles for {symbol}: {len(candles) if candles else 0}")
-        return False
-
-    df = ohlcv_to_dataframe(candles)
-    df = add_all_indicators(df)
-
-    console.print(
-        f"  ✅ Data ready: {len(df)} rows | "
-        f"{df.index[0].strftime('%Y-%m-%d')} → {df.index[-1].strftime('%Y-%m-%d')}"
-    )
-
-    model = MLModel(symbol=symbol)
-
-    console.print(f"  🧠 Training LSTM for [cyan]{symbol}[/]...")
-    history = model.train(df, epochs=50)
-
-    final_acc  = history.history.get("val_accuracy", [0])[-1]
-    final_loss = history.history.get("val_loss", [999])[-1]
-
-    console.print(
-        f"  ✅ [bold green]{symbol}[/] trained | "
-        f"val_acc=[bold]{final_acc:.2%}[/] | val_loss={final_loss:.4f}"
-    )
-    return True
-
-
-async def train_all(symbols: list, candle_limit: int):
-    """Train all symbols sequentially."""
-    console.rule("[bold cyan]🧠 AI Model Training[/]")
-
+async def fetch_data(symbol: str, candle_limit: int) -> list:
     exchange = create_exchange("binance")
-    connected = await exchange.connect()
-    if not connected:
-        console.print("[red]❌ Exchange connection failed[/]")
-        return
+    await exchange.connect()
+    print(f"  >> Fetching {candle_limit} candles for {symbol}...")
+    candles = await exchange.get_ohlcv(symbol, "15m", limit=candle_limit)
+    await exchange._exchange.close()
+    print(f"  >> Got {len(candles)} candles")
+    return candles
+
+
+def main(symbols: list, candle_limit: int):
+    print("=" * 60)
+    print("  AI Model Training (GradientBoosting + RandomForest)")
+    print("=" * 60)
 
     results = {}
     for symbol in symbols:
-        success = await train_symbol(exchange, symbol, candle_limit)
-        results[symbol] = "✅ Success" if success else "❌ Failed"
+        print(f"\n{'='*20} {symbol} {'='*20}")
+        try:
+            candles = asyncio.run(fetch_data(symbol, candle_limit))
+        except Exception as e:
+            print(f"  >> FETCH ERROR: {e}")
+            results[symbol] = "FAILED (fetch)"
+            continue
 
-    await exchange._exchange.close()
+        try:
+            df    = ohlcv_to_dataframe(candles)
+            df    = add_all_indicators(df)
+            model = MLModel(symbol=symbol)
+            model.train(df)
+            results[symbol] = "SUCCESS"
+        except Exception as e:
+            print(f"  >> TRAIN ERROR: {type(e).__name__}: {e}")
+            import traceback; traceback.print_exc()
+            results[symbol] = f"FAILED: {e}"
 
-    console.rule("[bold]Training Results[/]")
+    print("\n" + "=" * 60)
     for sym, status in results.items():
-        console.print(f"  {sym}: {status}")
-
-    console.print(
-        f"\n  Models saved to: [cyan]{settings.model.saved_models_dir}[/]"
-    )
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train AI trading models")
-    parser.add_argument(
-        "--symbols", nargs="+",
-        default=settings.trading_pairs,
-        help="Symbols to train"
-    )
-    parser.add_argument(
-        "--candles", type=int, default=1500,
-        help="Historical candles to use for training"
-    )
-    return parser.parse_args()
+        print(f"  {sym}: {status}")
+    print(f"\n  Saved to: {settings.model.saved_models_dir}")
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    asyncio.run(train_all(args.symbols, args.candles))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--symbols", nargs="+", default=settings.trading_pairs)
+    parser.add_argument("--candles", type=int, default=1500)
+    args = parser.parse_args()
+    main(args.symbols, args.candles)

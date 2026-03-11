@@ -1,37 +1,27 @@
 """
 core/trader/futures_trader.py
-──────────────────────────────
+------------------------------
 Main trading orchestrator for a single symbol.
-Coordinates: data → indicators → prediction → risk → execution → monitoring.
-
-One FuturesTrader instance per symbol per user.
+TP/SL monitored manually each cycle (Testnet compatible).
 """
 
 import asyncio
-from datetime import datetime
 from typing import Optional
 
 from core.exchange.base_exchange import BaseExchange, OrderSide, PositionInfo
 from core.models.hybrid_model import HybridModel
+from core.models.base_model import Signal
 from core.risk.risk_manager import RiskManager, TradeParameters
 from core.strategy.recovery_strategy import RecoveryStrategy
 from data.indicators import ohlcv_to_dataframe, add_all_indicators
 from config.logger import get_logger
-from config.settings import settings
 
 logger = get_logger(__name__)
 
 
 class FuturesTrader:
-    """
-    Manages the full lifecycle of trading a single symbol.
-    
-    Usage:
-        trader = FuturesTrader(exchange, "BTCUSDT", risk_manager, recovery)
-        await trader.run_cycle()   # Call on every candle close
-    """
 
-    TIMEFRAME = "15m"   # Primary analysis timeframe
+    TIMEFRAME = "15m"
 
     def __init__(
         self,
@@ -46,195 +36,218 @@ class FuturesTrader:
         self.recovery   = recovery_strategy
         self.model      = HybridModel(symbol=symbol)
 
-        self._current_position: Optional[PositionInfo] = None
-        self._is_active = True
-        self._cycles    = 0
+        self._is_active     = True
+        self._cycles        = 0
         self._trades_opened = 0
-        self._trades_closed = 0
+        self._in_position   = False
+
+        # TP/SL tracked locally (Testnet workaround)
+        self._tp_price: Optional[float] = None
+        self._sl_price: Optional[float] = None
+        self._position_side: Optional[OrderSide] = None
 
     async def run_cycle(self):
-        """
-        Execute one trading cycle:
-        1. Fetch data
-        2. Calculate indicators
-        3. Predict signal
-        4. Manage existing position (exit if needed)
-        5. Open new position (if signal + risk approved)
-        """
         if not self._is_active:
             return
 
         self._cycles += 1
-        logger.info(f"🔄 Cycle #{self._cycles} — {self.symbol}")
+        logger.info(f"Cycle #{self._cycles} — {self.symbol}")
 
         try:
-            # ── Step 1: Fetch & prepare data ──────────────────────────────
-            candles = await self.exchange.get_ohlcv(
-                self.symbol, self.TIMEFRAME, limit=300
-            )
+            # Step 1: Fetch & prepare data
+            candles = await self.exchange.get_ohlcv(self.symbol, self.TIMEFRAME, limit=300)
             if not candles or len(candles) < 50:
                 logger.warning(f"Insufficient candles for {self.symbol}")
                 return
 
-            df = ohlcv_to_dataframe(candles)
-            df = add_all_indicators(df)
+            df            = ohlcv_to_dataframe(candles)
+            df            = add_all_indicators(df)
             current_price = float(df["close"].iloc[-1])
 
-            # ── Step 2: Check existing position ───────────────────────────
-            await self._check_existing_position(current_price)
+            # Step 2: Check existing position on exchange
+            positions    = await self.exchange.get_open_positions()
+            current_pos  = next((p for p in positions if p.symbol == self.symbol), None)
 
-            # ── Step 3: Get prediction ─────────────────────────────────────
+            if current_pos:
+                self._in_position = True
+                await self._monitor_tpsl(current_pos, current_price)
+                return  # Already in position — skip entry logic
+
+            # Position was just closed externally (TP/SL hit on exchange side)
+            if self._in_position:
+                logger.info(f"[CLOSED] {self.symbol} position closed — ready for next")
+                self._reset_position_state()
+
+            # Step 3: Get AI prediction
             prediction = self.model.predict(df)
             logger.info(
-                f"🎯 {self.symbol} | Signal: {prediction.signal.value} | "
-                f"Conf: {prediction.confidence:.0%} | "
-                f"Source: {prediction.source}"
+                f"[SIGNAL] {self.symbol} -> {prediction.signal.value} | "
+                f"conf={prediction.confidence:.0%} | {prediction.source}"
             )
 
-            # ── Step 4: Skip if already in position ────────────────────────
-            if self._current_position:
-                logger.debug(f"{self.symbol} — position already open, skipping entry")
-                return
-
-            # ── Step 5: Determine trade direction ──────────────────────────
-            from core.models.base_model import Signal
+            # Step 4: Filter weak signals
             if prediction.signal == Signal.HOLD:
-                logger.info(f"⏸️  {self.symbol} — HOLD signal, no trade")
+                logger.info(f"[HOLD] {self.symbol} — skipping cycle")
                 return
 
-            side = (
-                OrderSide.LONG
-                if prediction.signal == Signal.LONG
-                else OrderSide.SHORT
-            )
+            if prediction.confidence < 0.65:
+                logger.info(
+                    f"[SKIP] {self.symbol} — confidence {prediction.confidence:.0%} "
+                    f"too low (need 65%+)"
+                )
+                return
 
-            # ── Step 6: Risk management ────────────────────────────────────
-            balance = await self.exchange.get_balance()
+            # Step 5: Side
+            side = OrderSide.LONG if prediction.signal == Signal.LONG else OrderSide.SHORT
 
-            # Check if recovery trade and apply multiplier
-            size_multiplier = 1.0
-            if self.recovery.is_in_recovery(self.symbol):
-                if self.recovery.should_open_recovery(self.symbol, prediction):
-                    size_multiplier = self.recovery.get_recovery_size_multiplier(
-                        self.symbol
-                    )
-                    logger.info(
-                        f"🔄 Recovery trade: {self.symbol} | "
-                        f"multiplier={size_multiplier:.2f}x"
-                    )
-                else:
-                    logger.info(f"⏸️  {self.symbol} — recovery conditions not met")
-                    return
+            # Step 6: Risk check
+            balance    = await self.exchange.get_balance()
+            total_open = len(positions)
+
+            if self.risk.is_daily_limit_hit(balance):
+                logger.warning(f"[DAILY LIMIT] Trading stopped for today")
+                return
 
             trade_params = self.risk.calculate_trade(
                 symbol=self.symbol,
                 side=side,
                 entry_price=current_price,
                 balance=balance,
-                open_trades=await self._count_open_trades(),
+                open_trades=total_open,
             )
 
             if not trade_params.approved:
-                logger.warning(
-                    f"🚫 Trade not approved: {self.symbol} — {trade_params.reject_reason}"
-                )
+                logger.warning(f"[REJECTED] {self.symbol} — {trade_params.reject_reason}")
                 return
 
-            # Apply recovery multiplier to quantity
-            if size_multiplier > 1.0:
-                trade_params.quantity = round(
-                    trade_params.quantity * size_multiplier, 3
-                )
+            # Step 7: Recovery size multiplier
+            if self.recovery.is_in_recovery(self.symbol):
+                if self.recovery.should_open_recovery(self.symbol, prediction):
+                    mult = self.recovery.get_recovery_size_multiplier(self.symbol)
+                    trade_params.quantity = round(trade_params.quantity * mult, 3)
+                    logger.info(f"[RECOVERY] {self.symbol} size x{mult:.1f}")
+                else:
+                    logger.info(f"[RECOVERY WAIT] {self.symbol} — signal not strong enough")
+                    return
 
-            # ── Step 7: Execute trade ──────────────────────────────────────
+            # Step 8: Execute trade
             await self._execute_trade(trade_params)
 
         except Exception as e:
-            logger.error(f"❌ Cycle error {self.symbol}: {e}", exc_info=True)
+            logger.error(f"Cycle error {self.symbol}: {e}", exc_info=True)
+
+    async def _monitor_tpsl(self, pos: PositionInfo, current_price: float):
+        """
+        Manually monitor TP/SL since Testnet does not support
+        TAKE_PROFIT_MARKET / STOP_MARKET order types.
+        On Live exchange these will be native orders instead.
+        """
+        if not self._tp_price or not self._sl_price:
+            pnl_pct = ((current_price - pos.entry_price) / pos.entry_price) * 100
+            if pos.side == OrderSide.SHORT:
+                pnl_pct = -pnl_pct
+            logger.info(
+                f"[WATCHING] {self.symbol} {pos.side.value.upper()} | "
+                f"entry={pos.entry_price:.4f} | now={current_price:.4f} | "
+                f"PnL={pos.unrealized_pnl:+.4f} USDT ({pnl_pct:+.2f}%)"
+            )
+            return
+
+        tp_hit = False
+        sl_hit = False
+
+        if pos.side == OrderSide.LONG:
+            tp_hit = current_price >= self._tp_price
+            sl_hit = current_price <= self._sl_price
+        else:  # SHORT
+            tp_hit = current_price <= self._tp_price
+            sl_hit = current_price >= self._sl_price
+
+        pnl_pct = ((current_price - pos.entry_price) / pos.entry_price) * 100
+        if pos.side == OrderSide.SHORT:
+            pnl_pct = -pnl_pct
+
+        logger.info(
+            f"[WATCHING] {self.symbol} {pos.side.value.upper()} | "
+            f"entry={pos.entry_price:.4f} | now={current_price:.4f} | "
+            f"TP={self._tp_price:.4f} | SL={self._sl_price:.4f} | "
+            f"PnL={pos.unrealized_pnl:+.4f} USDT ({pnl_pct:+.2f}%)"
+        )
+
+        if tp_hit:
+            logger.info(f"[TP HIT] {self.symbol} — closing for PROFIT")
+            result = await self.exchange.close_position(self.symbol)
+            if result.success:
+                self.recovery.record_profit(self.symbol, pos.unrealized_pnl)
+                self.risk.record_profit(pos.unrealized_pnl)
+                logger.info(f"[PROFIT] {self.symbol} closed | PnL={pos.unrealized_pnl:+.4f} USDT")
+            self._reset_position_state()
+
+        elif sl_hit:
+            logger.info(f"[SL HIT] {self.symbol} — closing to limit LOSS")
+            result = await self.exchange.close_position(self.symbol)
+            if result.success:
+                self.recovery.record_loss(self.symbol, pos.unrealized_pnl)
+                self.risk.record_loss(pos.unrealized_pnl)
+                logger.info(f"[LOSS] {self.symbol} closed | PnL={pos.unrealized_pnl:+.4f} USDT")
+            self._reset_position_state()
 
     async def _execute_trade(self, params: TradeParameters):
-        """Place the order and update state."""
         if params.side == OrderSide.LONG:
             result = await self.exchange.open_long(
-                symbol=params.symbol,
-                quantity=params.quantity,
+                symbol=params.symbol, quantity=params.quantity,
                 leverage=params.leverage,
-                take_profit=params.take_profit,
-                stop_loss=params.stop_loss,
+                take_profit=params.take_profit, stop_loss=params.stop_loss,
             )
         else:
             result = await self.exchange.open_short(
-                symbol=params.symbol,
-                quantity=params.quantity,
+                symbol=params.symbol, quantity=params.quantity,
                 leverage=params.leverage,
-                take_profit=params.take_profit,
-                stop_loss=params.stop_loss,
+                take_profit=params.take_profit, stop_loss=params.stop_loss,
             )
 
         if result.success:
-            self._trades_opened += 1
-            logger.info(
-                f"✅ Trade #{self._trades_opened} opened | "
-                f"{params.symbol} {params.side.value.upper()} | "
-                f"qty={params.quantity} @ {result.price} | "
-                f"TP={params.take_profit} | SL={params.stop_loss}"
-            )
-        else:
-            logger.error(f"❌ Trade failed: {result.message}")
-
-    async def _check_existing_position(self, current_price: float):
-        """Check if current position needs manual closure or has been closed by TP/SL."""
-        positions = await self.exchange.get_open_positions()
-        self._current_position = next(
-            (p for p in positions if p.symbol == self.symbol), None
-        )
-
-        if self._current_position:
-            pnl = self._current_position.unrealized_pnl
-            entry = self._current_position.entry_price
-            pnl_pct = ((current_price - entry) / entry) * 100
-            side = self._current_position.side.value
+            self._trades_opened  += 1
+            self._in_position    = True
+            self._tp_price       = params.take_profit
+            self._sl_price       = params.stop_loss
+            self._position_side  = params.side
 
             logger.info(
-                f"📊 Open position: {self.symbol} {side.upper()} | "
-                f"entry={entry} | current={current_price} | "
-                f"PnL={pnl:+.4f} USDT ({pnl_pct:+.2f}%)"
+                f"[OPENED] #{self._trades_opened} {params.symbol} "
+                f"{params.side.value.upper()} | "
+                f"qty={params.quantity} @ {result.price:.4f} | "
+                f"TP={params.take_profit:.4f} | SL={params.stop_loss:.4f}"
             )
-
-            # Record if position was closed externally (TP/SL hit)
         else:
-            # Position was closed (TP/SL hit or manual close)
-            # We can't easily detect this here without tracking previous state
-            pass
+            logger.error(f"[FAILED] {params.symbol}: {result.message}")
 
-    async def _count_open_trades(self) -> int:
-        """Count how many positions are currently open across all symbols."""
-        positions = await self.exchange.get_open_positions()
-        return len(positions)
+    def _reset_position_state(self):
+        self._in_position   = False
+        self._tp_price      = None
+        self._sl_price      = None
+        self._position_side = None
 
     async def train_ml_model(self, candle_limit: int = 1000):
-        """Fetch historical data and train the ML model for this symbol."""
-        logger.info(f"🧠 Starting ML training for {self.symbol}...")
-
-        candles = await self.exchange.get_ohlcv(
-            self.symbol, self.TIMEFRAME, limit=candle_limit
-        )
+        logger.info(f"Starting ML training for {self.symbol}...")
+        candles = await self.exchange.get_ohlcv(self.symbol, self.TIMEFRAME, limit=candle_limit)
         df = ohlcv_to_dataframe(candles)
         df = add_all_indicators(df)
-
         self.model.train_ml(df, epochs=50)
-        logger.info(f"✅ ML training complete for {self.symbol}")
+        logger.info(f"ML training complete for {self.symbol}")
 
     def stop(self):
-        """Stop this trader gracefully."""
         self._is_active = False
-        logger.info(f"🛑 FuturesTrader stopped: {self.symbol}")
+        logger.info(f"Trader stopped: {self.symbol}")
 
     def get_stats(self) -> dict:
         return {
-            "symbol":         self.symbol,
-            "cycles":         self._cycles,
-            "trades_opened":  self._trades_opened,
-            "in_recovery":    self.recovery.is_in_recovery(self.symbol),
-            "ml_trained":     self.model.ml_is_trained,
+            "symbol":        self.symbol,
+            "cycles":        self._cycles,
+            "trades_opened": self._trades_opened,
+            "in_position":   self._in_position,
+            "tp":            self._tp_price,
+            "sl":            self._sl_price,
+            "in_recovery":   self.recovery.is_in_recovery(self.symbol),
+            "ml_trained":    self.model.ml_is_trained,
         }

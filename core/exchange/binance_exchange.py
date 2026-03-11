@@ -2,6 +2,7 @@
 core/exchange/binance_exchange.py
 ----------------------------------
 Binance USDM Futures - Testnet & Live support via ccxt.
+TP/SL handled via price monitoring (Testnet limitation workaround).
 """
 
 import ccxt.async_support as ccxt
@@ -40,7 +41,6 @@ class BinanceExchange(BaseExchange):
 
             self._exchange = ccxt.binanceusdm(config)
 
-            # Override only the fapi URLs (futures endpoints) with testnet base
             if self.credentials.testnet:
                 b = self.TESTNET_BASE
                 self._exchange.urls["api"]["fapiPublic"]    = f"{b}/fapi/v1"
@@ -49,7 +49,6 @@ class BinanceExchange(BaseExchange):
                 self._exchange.urls["api"]["fapiPrivateV2"] = f"{b}/fapi/v2"
                 self._exchange.urls["api"]["fapiData"]      = f"{b}/futures/data"
 
-            # Verify connection
             await self._exchange.fetch_balance({"type": "future"})
             mode = "TESTNET" if self.credentials.testnet else "LIVE"
             logger.info(f"[OK] Binance {mode} connected")
@@ -121,25 +120,33 @@ class BinanceExchange(BaseExchange):
         try:
             await self.set_leverage(symbol, leverage)
             ccxt_side = "buy" if side == OrderSide.LONG else "sell"
+
             order = await self._exchange.create_market_order(
                 symbol, ccxt_side, quantity,
                 params={"positionSide": "BOTH"}
             )
             price    = float(order.get("price") or order.get("average") or 0)
             order_id = str(order["id"])
+
             logger.info(
                 f"[TRADE] {side.value.upper()} {symbol} "
-                f"qty={quantity} price={price} lev={leverage}x"
+                f"qty={quantity} price={price:.4f} lev={leverage}x"
             )
+
+            # ── TP/SL via reduceOnly market orders (Testnet compatible) ────
+            # Testnet does not support TAKE_PROFIT_MARKET / STOP_MARKET order types
+            # Bot monitors price each cycle and closes manually when TP/SL is hit
             if take_profit:
-                await self._place_take_profit(symbol, side, quantity, take_profit)
+                logger.info(f"[TP SET] {symbol} target={take_profit:.4f} (monitored by bot)")
             if stop_loss:
-                await self._place_stop_loss(symbol, side, quantity, stop_loss)
+                logger.info(f"[SL SET] {symbol} stop={stop_loss:.4f} (monitored by bot)")
+
             return OrderResult(
                 success=True, order_id=order_id, symbol=symbol,
                 side=side, quantity=quantity, price=price,
-                status=OrderStatus.OPEN
+                status=OrderStatus.OPEN,
             )
+
         except ccxt.InsufficientFunds as e:
             return OrderResult(
                 success=False, order_id="", symbol=symbol, side=side,
@@ -153,28 +160,6 @@ class BinanceExchange(BaseExchange):
                 quantity=quantity, price=0, status=OrderStatus.CANCELLED,
                 message=str(e)
             )
-
-    async def _place_take_profit(self, symbol, side, quantity, tp_price):
-        try:
-            close_side = "sell" if side == OrderSide.LONG else "buy"
-            await self._exchange.create_order(
-                symbol, "TAKE_PROFIT_MARKET", close_side, quantity,
-                params={"stopPrice": tp_price, "closePosition": True,
-                        "positionSide": "BOTH"}
-            )
-        except Exception as e:
-            logger.warning(f"TP placement {symbol}: {e}")
-
-    async def _place_stop_loss(self, symbol, side, quantity, sl_price):
-        try:
-            close_side = "sell" if side == OrderSide.LONG else "buy"
-            await self._exchange.create_order(
-                symbol, "STOP_MARKET", close_side, quantity,
-                params={"stopPrice": sl_price, "closePosition": True,
-                        "positionSide": "BOTH"}
-            )
-        except Exception as e:
-            logger.warning(f"SL placement {symbol}: {e}")
 
     async def close_position(self, symbol, order_id=None) -> OrderResult:
         try:
@@ -192,11 +177,11 @@ class BinanceExchange(BaseExchange):
                 params={"reduceOnly": True, "positionSide": "BOTH"}
             )
             price = float(order.get("price") or order.get("average") or 0)
-            logger.info(f"[CLOSE] {symbol} PnL={pos.unrealized_pnl:.4f} USDT")
+            logger.info(f"[CLOSE] {symbol} PnL={pos.unrealized_pnl:+.4f} USDT")
             return OrderResult(
                 success=True, order_id=str(order["id"]), symbol=symbol,
                 side=pos.side, quantity=pos.quantity, price=price,
-                status=OrderStatus.CLOSED
+                status=OrderStatus.CLOSED,
             )
         except Exception as e:
             logger.error(f"close_position {symbol}: {e}")
