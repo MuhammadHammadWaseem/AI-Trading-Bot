@@ -232,22 +232,49 @@ class FuturesTrader:
 
     def _recover_tpsl_from_position(self, pos: PositionInfo,
                                     current_atr: Optional[float]):
-        """Reconstruct TP/SL if state was lost (restart while in a position)."""
+        """
+        Reconstruct TP/SL and portfolio tracker state if lost (e.g. restart
+        while a position was open). Called every cycle while in a position,
+        but the _tp_price guard means it only acts on the first call.
+
+        Also registers with PortfolioRiskTracker so the dashboard shows
+        correct open risk instead of "Positions: none" after a restart.
+        """
         if self._tp_price is not None and self._sl_price is not None:
-            return
+            return   # already recovered
+
         if current_atr and current_atr > 0:
-            tp, sl = self._compute_atr_tpsl(pos.entry_price, pos.side, current_atr)
+            tp, sl   = self._compute_atr_tpsl(pos.entry_price, pos.side, current_atr)
+            sl_dist  = abs(pos.entry_price - sl)
+
             self._tp_price      = tp
             self._sl_price      = sl
             self._position_side = pos.side
             self._entry_price   = pos.entry_price
-            self._sl_distance   = abs(pos.entry_price - sl)
+            self._sl_distance   = sl_dist
             if self._entry_bar is None:
                 self._entry_bar = self._bar_counter
-            logger.info(
-                f"[RECOVERED TP/SL] {self.symbol}: "
-                f"entry={pos.entry_price:.4f}  TP={tp:.4f}  SL={sl:.4f}"
-            )
+
+            # Estimate USDT at risk: quantity (base units) × SL distance (USDT/unit)
+            estimated_risk_usdt = pos.quantity * sl_dist
+
+            # Register with portfolio tracker — avoids double-registering on
+            # repeated calls by checking if symbol is already tracked.
+            if (self._portfolio_tracker is not None
+                    and _normalize_symbol(self.symbol)
+                    not in self._portfolio_tracker._open_risks):
+                self._portfolio_tracker.register_open(
+                    self.symbol, estimated_risk_usdt)
+                logger.info(
+                    f"[RECOVERED TP/SL] {self.symbol}: "
+                    f"entry={pos.entry_price:.4f}  TP={tp:.4f}  SL={sl:.4f}  "
+                    f"risk~{estimated_risk_usdt:.2f} USDT"
+                )
+            else:
+                logger.info(
+                    f"[RECOVERED TP/SL] {self.symbol}: "
+                    f"entry={pos.entry_price:.4f}  TP={tp:.4f}  SL={sl:.4f}"
+                )
         else:
             logger.warning(
                 f"[CANNOT RECOVER TP/SL] {self.symbol}: no ATR. "

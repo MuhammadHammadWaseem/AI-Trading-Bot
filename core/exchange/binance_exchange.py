@@ -163,23 +163,30 @@ class BinanceExchange(BaseExchange):
 
     async def close_position(self, symbol, order_id=None) -> OrderResult:
         try:
+            # Normalize incoming symbol to match what get_open_positions() stores
+            norm_sym = symbol.replace("/", "").replace(":USDT", "").replace(":BTC", "").upper()
+
             positions = await self.get_open_positions()
-            pos = next((p for p in positions if p.symbol == symbol), None)
+            pos = next((p for p in positions if p.symbol == norm_sym), None)
             if not pos:
                 return OrderResult(
-                    success=False, order_id="", symbol=symbol,
+                    success=False, order_id="", symbol=norm_sym,
                     side=OrderSide.LONG, quantity=0, price=0,
                     status=OrderStatus.CLOSED, message="No open position"
                 )
+
             close_side = "sell" if pos.side == OrderSide.LONG else "buy"
             order = await self._exchange.create_market_order(
-                symbol, close_side, pos.quantity,
+                norm_sym, close_side, pos.quantity,
                 params={"reduceOnly": True, "positionSide": "BOTH"}
             )
             price = float(order.get("price") or order.get("average") or 0)
-            logger.info(f"[CLOSE] {symbol} PnL={pos.unrealized_pnl:+.4f} USDT")
+            logger.info(
+                f"[CLOSE] {norm_sym} qty={pos.quantity} "
+                f"PnL={pos.unrealized_pnl:+.4f} USDT"
+            )
             return OrderResult(
-                success=True, order_id=str(order["id"]), symbol=symbol,
+                success=True, order_id=str(order["id"]), symbol=norm_sym,
                 side=pos.side, quantity=pos.quantity, price=price,
                 status=OrderStatus.CLOSED,
             )
@@ -199,8 +206,12 @@ class BinanceExchange(BaseExchange):
                 if float(p.get("contracts", 0)) == 0:
                     continue
                 side = OrderSide.LONG if p["side"] == "long" else OrderSide.SHORT
+                # Normalize symbol from ccxt format (e.g. "BTC/USDT:USDT") to
+                # plain format (e.g. "BTCUSDT") so close_position() can match it.
+                raw_sym  = p["symbol"]
+                norm_sym = raw_sym.replace("/", "").replace(":USDT", "").replace(":BTC", "").upper()
                 result.append(PositionInfo(
-                    symbol=p["symbol"], side=side,
+                    symbol=norm_sym, side=side,
                     entry_price=float(p.get("entryPrice", 0)),
                     current_price=float(p.get("markPrice", 0)),
                     quantity=float(p.get("contracts", 0)),
