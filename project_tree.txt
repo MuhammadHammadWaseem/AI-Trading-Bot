@@ -1,0 +1,100 @@
+AI Trading Bot
+├── .env
+├── .env.example
+├── .gitattributes
+├── .gitignore
+├── README.md
+├── UPGRADE_INTEGRATION.md
+├── api
+│   ├── routes
+│   └── schemas
+├── backtesting
+│   ├── __init__.py
+│   ├── engine.py
+│   ├── metrics.py
+│   └── portfolio.py
+├── config
+│   ├── __init__.py
+│   ├── logger.py
+│   └── settings.py
+├── core
+│   ├── __init__.py
+│   ├── exchange
+│   │   ├── __init__.py
+│   │   ├── base_exchange.py
+│   │   ├── binance_exchange.py
+│   │   └── exchange_factory.py
+│   ├── models
+│   │   ├── __init__.py
+│   │   ├── base_model.py
+│   │   ├── hybrid_model.py
+│   │   ├── ml_model.py
+│   │   └── technical_model.py
+│   ├── risk
+│   │   ├── __init__.py
+│   │   └── risk_manager.py
+│   ├── strategy
+│   │   ├── __init__.py
+│   │   └── recovery_strategy.py
+│   └── trader
+│       ├── __init__.py
+│       └── futures_trader.py
+├── data
+│   ├── __init__.py
+│   └── indicators.py
+├── database
+│   └── __init__.py
+├── execution
+│   └── __init__.py
+├── get_tree.ps1
+├── get_tree.py
+├── logs
+│   ├── .gitkeep
+│   └── trading_bot.log
+├── models
+│   ├── __init__.py
+│   ├── inference
+│   │   └── __init__.py
+│   └── training
+│       ├── __init__.py
+│       ├── label_engine.py
+│       └── trainer.py
+├── project_tree.txt
+├── requirements.txt
+├── research
+│   ├── __init__.py
+│   └── walk_forward.py
+├── risk_management
+│   ├── __init__.py
+│   └── position_sizer.py
+├── scripts
+│   ├── __init__.py
+│   ├── run_bot.py
+│   ├── train_all.py
+│   ├── train_from_history.py
+│   └── validate_models.py
+├── strategy
+│   └── __init__.py
+├── tests
+│   └── __init__.py
+├── training
+│   ├── __init__.py
+│   ├── backtester.py
+│   ├── download_data.py
+│   ├── train_production.py
+│   └── trainer.py
+├── training_data
+│   ├── BNBUSDT_15m.parquet
+│   ├── BNBUSDT_1h.parquet
+│   ├── BNBUSDT_4h.parquet
+│   ├── BTCUSDT_15m.parquet
+│   ├── BTCUSDT_1h.parquet
+│   ├── BTCUSDT_4h.parquet
+│   ├── ETHUSDT_15m.parquet
+│   ├── ETHUSDT_1h.parquet
+│   ├── ETHUSDT_4h.parquet
+│   ├── SOLUSDT_15m.parquet
+│   ├── SOLUSDT_1h.parquet
+│   └── SOLUSDT_4h.parquet
+└── workers
+    └── __init__.py

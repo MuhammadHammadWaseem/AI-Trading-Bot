@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.exchange.exchange_factory import create_exchange
 from core.risk.risk_manager import RiskManager
 from core.strategy.recovery_strategy import RecoveryStrategy
-from core.trader.futures_trader import FuturesTrader, _normalize_symbol
+from core.trader.futures_trader import FuturesTrader, PortfolioRiskTracker, _normalize_symbol
 from config.settings import settings, RiskSettings
 from config.logger import get_logger
 from rich.console import Console
@@ -45,12 +45,12 @@ signal.signal(signal.SIGINT,  signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 
-async def print_dashboard(exchange, traders: List[FuturesTrader]):
+async def print_dashboard(exchange, traders: List[FuturesTrader],
+                          portfolio_tracker: PortfolioRiskTracker):
     try:
         balance   = await exchange.get_balance()
         positions = await exchange.get_open_positions()
 
-        # Build position lookup by normalized symbol
         pos_map = {}
         for p in positions:
             pos_map[_normalize_symbol(p.symbol)] = p
@@ -59,46 +59,54 @@ async def print_dashboard(exchange, traders: List[FuturesTrader]):
             title=f"AI Trading Bot — {datetime.now().strftime('%H:%M:%S')}",
             box=box.ROUNDED, border_style="cyan",
         )
-        table.add_column("Symbol",   style="bold white")
-        table.add_column("Cycles",   justify="right")
-        table.add_column("ML",       justify="center")
-        table.add_column("Side",     justify="center")
-        table.add_column("Entry",    justify="right")
-        table.add_column("TP / SL",  justify="center")
-        table.add_column("PnL",      justify="right")
+        table.add_column("Symbol",    style="bold white")
+        table.add_column("Cycles",    justify="right")
+        table.add_column("ML",        justify="center")
+        table.add_column("Threshold", justify="center")
+        table.add_column("Side",      justify="center")
+        table.add_column("Entry",     justify="right")
+        table.add_column("TP / SL",   justify="center")
+        table.add_column("Bars",      justify="right")
+        table.add_column("PnL",       justify="right")
 
         for t in traders:
             stats = t.get_stats()
             pos   = pos_map.get(_normalize_symbol(t.symbol))
 
             if pos:
-                side_str  = "[green]LONG[/]"  if pos.side.value == "long" else "[red]SHORT[/]"
+                side_str  = "[green]LONG[/]" if pos.side.value == "long" else "[red]SHORT[/]"
                 entry_str = f"{pos.entry_price:.2f}"
                 pnl_val   = pos.unrealized_pnl
-                pnl_str   = f"[green]+{pnl_val:.4f}[/]" if pnl_val >= 0 else f"[red]{pnl_val:.4f}[/]"
+                pnl_str   = (f"[green]+{pnl_val:.4f}[/]" if pnl_val >= 0
+                             else f"[red]{pnl_val:.4f}[/]")
                 tp_sl_str = (f"{stats['tp']:.2f} / {stats['sl']:.2f}"
                              if stats["tp"] else "monitoring...")
+                bars_str  = str(stats.get("bars_held", 0))
             else:
                 side_str  = "[dim]Watching[/]"
                 entry_str = "—"
                 pnl_str   = "—"
                 tp_sl_str = "—"
+                bars_str  = "—"
 
             table.add_row(
                 stats["symbol"],
                 str(stats["cycles"]),
                 "[green]YES[/]" if stats["ml_trained"] else "[yellow]NO[/]",
+                f"{stats.get('conf_threshold', 0.42):.0%}",
                 side_str,
                 entry_str,
                 tp_sl_str,
+                bars_str,
                 pnl_str,
             )
 
         console.print(table)
 
-        pnl_color = "green" if balance.unrealized_pnl >= 0 else "red"
-        start_bal = 5000.0
-        total_pnl = balance.total_balance - start_bal
+        # ── Balance row ───────────────────────────────────────────────────────
+        pnl_color   = "green" if balance.unrealized_pnl >= 0 else "red"
+        start_bal   = 5000.0
+        total_pnl   = balance.total_balance - start_bal
         total_color = "green" if total_pnl >= 0 else "red"
 
         console.print(
@@ -106,6 +114,21 @@ async def print_dashboard(exchange, traders: List[FuturesTrader]):
             f"Available: [cyan]{balance.available_balance:.2f} USDT[/]  |  "
             f"Floating: [{pnl_color}]{balance.unrealized_pnl:+.4f} USDT[/]  |  "
             f"Session PnL: [{total_color}]{total_pnl:+.2f} USDT[/]"
+        )
+
+        # ── Portfolio risk row ────────────────────────────────────────────────
+        port_status  = portfolio_tracker.get_status()
+        open_risk    = port_status["total_risk_usdt"]
+        cap          = balance.available_balance * 0.03   # 3% cap
+        risk_color   = "red" if open_risk >= cap * 0.9 else "yellow" if open_risk > 0 else "green"
+        open_pos_str = ", ".join(
+            f"{sym}={r:.2f}" for sym, r in port_status["by_symbol"].items()
+        ) or "none"
+
+        console.print(
+            f"  Portfolio risk: [{risk_color}]{open_risk:.2f} USDT open[/]  |  "
+            f"Cap: {cap:.2f} USDT (3%)  |  "
+            f"Positions: {open_pos_str}"
         )
 
     except Exception as e:
@@ -119,7 +142,8 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct, interval):
     console.print(f"  Environment : [bold]{settings.environment.upper()}[/]")
     console.print(f"  Pairs       : {', '.join(pairs)}")
     console.print(f"  Leverage    : {leverage}x  |  TP: {tp_pct}%  |  SL: {sl_pct}%")
-    console.print(f"  Cycle every : {interval}s\n")
+    console.print(f"  Cycle every : {interval}s")
+    console.print(f"  Conf thresholds: BTC/BNB=42%  ETH/SOL=38%  (per-symbol)\n")
 
     exchange  = create_exchange("binance")
     connected = await exchange.connect()
@@ -142,10 +166,18 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct, interval):
     risk_manager.set_session_balance(balance.total_balance)
     console.print(f"  Starting balance: [bold green]{balance.total_balance:.2f} USDT[/]\n")
 
+    # ── Create ONE shared portfolio risk tracker ──────────────────────────────
+    # Passed into every FuturesTrader so they all share the same open-risk view.
+    # Blocks new entries when total open risk across all symbols >= 3% of balance.
+    portfolio_tracker = PortfolioRiskTracker()
+
     for symbol in pairs:
         trader = FuturesTrader(
-            exchange=exchange, symbol=symbol,
-            risk_manager=risk_manager, recovery_strategy=recovery,
+            exchange=exchange,
+            symbol=symbol,
+            risk_manager=risk_manager,
+            recovery_strategy=recovery,
+            portfolio_risk_tracker=portfolio_tracker,   # ← wired here
         )
         _traders.append(trader)
         logger.info(f"Trader ready: {symbol}")
@@ -165,7 +197,7 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct, interval):
                 *[t.run_cycle() for t in _traders],
                 return_exceptions=True
             )
-            await print_dashboard(exchange, _traders)
+            await print_dashboard(exchange, _traders, portfolio_tracker)
 
             for _ in range(interval):
                 if not _running:

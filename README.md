@@ -9,16 +9,19 @@ Scalable, professional-grade AI trading bot for crypto futures.
 
 ```
 trading-bot/
-├── config/              # Settings, logging
+├── api/                 # API endpoints & routing (Prepared for Phase 3)
+├── config/              # Configuration & settings, logger
 ├── core/
 │   ├── exchange/        # Exchange connectors (Binance + future exchanges)
 │   ├── models/          # Technical, ML (LSTM), Hybrid AI models
 │   ├── strategy/        # Loss recovery strategy
 │   ├── risk/            # Risk & position management
 │   └── trader/          # Trade orchestrator per symbol
-├── data/                # Data fetching & indicators
+├── data/                # Data fetching & technical indicators
+├── database/            # Database schemas & migrations (Prepared for Phase 3)
 ├── training/            # ML training & backtesting
-├── scripts/             # Entry points
+├── scripts/             # Entry points & runners
+├── workers/             # Background task workers (Prepared for Phase 5)
 └── saved_models/        # Trained model weights (auto-generated)
 ```
 
@@ -110,35 +113,34 @@ python scripts/run_bot.py \
 
 ---
 
-## 🧠 How the AI Works
+## 🧠 Internal Architecture & AI Pipeline
 
-```
-Market Data (OHLCV 15m)
-        ↓
-Technical Indicators (RSI, MACD, EMA, BB, ADX, Stoch, ATR...)
-        ↓
-   ┌────────────┬─────────────┐
-   │  Technical │  LSTM Model │  ← 40% / 60% weight
-   │   Model    │  (trained)  │
-   └─────┬──────┴──────┬──────┘
-         └──────┬───────┘
-           Hybrid Model
-                ↓
-        LONG / SHORT / HOLD
-        + Confidence Score
-                ↓
-         Risk Manager
-      (position size, TP/SL)
-                ↓
-         Execute Trade
-```
+The bot's decision engine is split into three main components: a **Technical Model**, a **Machine Learning Model**, and a **Hybrid Orchestrator** that bridges the two. 
 
-### Hybrid Weighting
-- **Technical model only** — when ML not yet trained
-- **40% Technical + 60% ML** — when ML is trained
-- **Agreement bonus** (+10% confidence) — when both models agree
-- **Disagreement penalty** (×0.75 confidence) — when models disagree
-- **Confidence gate** — if below 65%, force HOLD
+### 1. The Data Pipeline
+Market data is streamed at 15m intervals (converting OHLCV). The system then computes baseline technical indicators (RSI, MACD, EMA 9/21/50, Bollinger Bands, Stochastic K/D, ATR, ADX, and Volume Ratios).
+
+### 2. The Technical Model (Rule-Based Scoring)
+The `TechnicalModel` evaluates the latest candle against 7 distinct indicator groups. It works instantly (zero training required) and assigns a score from `-1.0` (Strong SHORT) to `+1.0` (Strong LONG).
+* **RSI:** Penalizes extreme readings (<30 or >70).
+* **MACD:** Looks for structural crossovers & histogram shifts.
+* **EMA Trend:** Scores alignment between Price, EMA 9, EMA 21, and EMA 50.
+* **Bollinger Bands:** Counters price action at the extreme bands.
+* **Stochastic & ADX:** Confirms momentum and dampens signals in weak (ranging) markets.
+* **Volume Profiling:** Amplifies signals on volume spikes (>1.5x ratio) and penalizes low engagement.
+
+### 3. The ML Model (LightGBM + XGBoost Ensemble)
+The `MLModel` is a production-grade predictive engine designed to classify the next significant price movement.
+* **Feature Engineering:** Constructs **80+ features**, including price action wicks, rolling statistics, multi-period return percentages, time-based features, and volatility spikes.
+* **Label Generation:** It looks forward 4 candles. If the return is `> 0.4%`, it labels `LONG`. If `< -0.4%`, it labels `SHORT`. Otherwise, `HOLD`.
+* **Ensemble Soft-Voting:** By default, it trains both `LightGBM` and `XGBoost` classifiers on a walk-forward validation split. Predicts probabilities, weights them, and arrives at a consensus. *(Falls back to Sklearn GradientBoosting & Random Forests if booster libs are omitted).*
+
+### 4. The Hybrid Orchestrator
+The `HybridModel` is where Technical and ML predictions meet.
+* **Base Weights:** Technical Analysis has a `40%` baseline weight. The trained ML model has a `60%` baseline weight.
+* **Agreement Bonus (+10%):** If both the Technical and ML models agree on LONG or SHORT, the hybrid confidence score receives an artificial `+10%` boost.
+* **Disagreement Penalty (×0.75):** If the models clash, the signal's confidence is drastically reduced.
+* **The Confidence Gate (>65%):** The final signal requires a mathematically combined confidence of strictly **>65%**. If it falls below this gate, the bot forces a **HOLD**, refusing to enter a trade in choppy conditions.
 
 ---
 
@@ -169,9 +171,11 @@ When a trade closes at a loss:
 |-------|--------|-------------|
 | 1 | ✅ **Current** | Terminal bot, Binance testnet, Hybrid AI |
 | 2 | ⏳ | Model retraining scheduler, performance monitoring |
-| 3 | ⏳ | Laravel API integration, multi-user support |
+| 3 | ⏳ | Python/Laravel API integration, multi-user support |
 | 4 | ⏳ | Add OKX, Bybit, other exchanges |
 | 5 | ⏳ | Web dashboard, Celery workers, production deploy |
+
+> **Note:** Core skeleton directories for the future Python backend API (`api/`, `database/`, `workers/`) are already initialized.
 
 ---
 
