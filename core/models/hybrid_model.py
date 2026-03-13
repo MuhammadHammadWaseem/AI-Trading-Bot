@@ -9,6 +9,8 @@ Key changes from original:
   3. Confidence gate reduced from 0.65 to 0.55 (calibrated probabilities are lower)
   4. Agreement bonus retained but only for strong signals
   5. Disagreement now gives HOLD only if confidence < 0.55 (was 0.65)
+  6. models_agree field now propagated to PredictionResult so FuturesTrader
+     can optionally require agreement before entering (REQUIRE_AGREEMENT flag)
 """
 
 from __future__ import annotations
@@ -68,12 +70,13 @@ class HybridModel(BaseModel):
         else:
             logger.debug(f"[HYBRID] ML not trained for {self.symbol} — Technical only")
             return PredictionResult(
-                signal           = tech_pred.signal,
-                confidence       = tech_pred.confidence,
-                long_probability = tech_pred.long_probability,
-                short_probability= tech_pred.short_probability,
-                source           = "hybrid(technical_only)",
-                reasoning        = f"[TECH] {tech_pred.reasoning}",
+                signal            = tech_pred.signal,
+                confidence        = tech_pred.confidence,
+                long_probability  = tech_pred.long_probability,
+                short_probability = tech_pred.short_probability,
+                source            = "hybrid(technical_only)",
+                reasoning         = f"[TECH] {tech_pred.reasoning}",
+                models_agree      = False,  # only one model available
             )
 
     def _combine(self, tech: PredictionResult, ml: PredictionResult) -> PredictionResult:
@@ -94,7 +97,7 @@ class HybridModel(BaseModel):
         p_hold  = max(0.0, 1.0 - p_long - p_short)
 
         # Normalize
-        total = p_long + p_short + p_hold + 1e-10
+        total   = p_long + p_short + p_hold + 1e-10
         p_long  /= total
         p_short /= total
         p_hold  /= total
@@ -110,22 +113,27 @@ class HybridModel(BaseModel):
             signal     = Signal.HOLD
             confidence = p_hold
 
-        # Agreement bonus — only for directional signals
+        # Agreement: both models independently chose the same direction
         agrees = tech.signal == ml.signal and tech.signal != Signal.HOLD
+
+        # Agreement bonus — only for directional signals where both agree
         if agrees and signal != Signal.HOLD:
-            confidence = min(1.0, confidence + self.AGREEMENT_BONUS)
+            confidence    = min(1.0, confidence + self.AGREEMENT_BONUS)
             agreement_str = "AGREE"
         else:
-            # NO penalty — models may specialize in different conditions
+            # NO penalty — models may specialize in different conditions.
+            # SPLIT just means we rely more on the blended probability alone.
             agreement_str = "SPLIT" if tech.signal != ml.signal else "BOTH_HOLD"
 
         # Final confidence gate — only suppress very uncertain signals
         if signal != Signal.HOLD and confidence < self.MIN_CONFIDENCE:
             logger.debug(
-                f"[HYBRID] {self.symbol} conf {confidence:.0%} < {self.MIN_CONFIDENCE:.0%} → HOLD"
+                f"[HYBRID] {self.symbol} conf {confidence:.0%} < "
+                f"{self.MIN_CONFIDENCE:.0%} → HOLD"
             )
             signal     = Signal.HOLD
             confidence = p_hold
+            agrees     = False
 
         reasoning = (
             f"[HYBRID {agreement_str}] "
@@ -135,15 +143,19 @@ class HybridModel(BaseModel):
             f"→ {signal.value}({confidence:.0%})"
         )
 
-        logger.info(f"[HYBRID] {self.symbol} {signal.value} | conf={confidence:.0%} | {agreement_str}")
+        logger.info(
+            f"[HYBRID] {self.symbol} {signal.value} | "
+            f"conf={confidence:.0%} | {agreement_str}"
+        )
 
         return PredictionResult(
-            signal           = signal,
-            confidence       = confidence,
-            long_probability = p_long,
-            short_probability= p_short,
-            source           = "hybrid",
-            reasoning        = reasoning,
+            signal            = signal,
+            confidence        = confidence,
+            long_probability  = p_long,
+            short_probability = p_short,
+            source            = "hybrid",
+            reasoning         = reasoning,
+            models_agree      = agrees,   # ← now passed through to trader
         )
 
     def train_ml(self, df: pd.DataFrame, **kwargs):

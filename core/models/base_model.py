@@ -6,7 +6,7 @@ Signal enum used across the entire project.
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 import pandas as pd
@@ -21,12 +21,17 @@ class Signal(str, Enum):
 @dataclass
 class PredictionResult:
     """Unified prediction output from any model."""
-    signal:           Signal
-    confidence:       float        # 0.0 – 1.0
-    long_probability: float        # Probability of price going up
-    short_probability: float       # Probability of price going down
-    source:           str          # "technical" | "ml" | "hybrid"
-    reasoning:        str = ""     # Human-readable explanation
+    signal:            Signal
+    confidence:        float        # 0.0 – 1.0
+    long_probability:  float        # Probability of price going up
+    short_probability: float        # Probability of price going down
+    source:            str          # "technical" | "ml" | "hybrid"
+    reasoning:         str  = ""    # Human-readable explanation
+
+    # True when both technical AND ML models independently agree on direction.
+    # False (SPLIT) when one model disagrees or only one model is available.
+    # Used by FuturesTrader to optionally require agreement before entering.
+    models_agree:      bool = False
 
 
 class BaseModel(ABC):
