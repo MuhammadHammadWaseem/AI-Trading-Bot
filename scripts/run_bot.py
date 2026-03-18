@@ -66,6 +66,7 @@ async def print_dashboard(exchange, traders: List[FuturesTrader],
         table.add_column("Symbol",    style="bold white")
         table.add_column("Cycles",    justify="right")
         table.add_column("ML",        justify="center")
+        table.add_column("Regime",    justify="center")
         table.add_column("Threshold", justify="center")
         table.add_column("Side",      justify="center")
         table.add_column("Entry",     justify="right")
@@ -99,10 +100,26 @@ async def print_dashboard(exchange, traders: List[FuturesTrader],
                 tp_sl_str = "—"
                 bars_str  = "—"
 
+            # Regime display
+            regime_val = stats.get("regime", "UNKNOWN")
+            atr_ratio  = stats.get("regime_atr_ratio", 1.0)
+            size_scale = stats.get("regime_size_scale", 1.0)
+            if regime_val == "TRENDING":
+                regime_str = "[cyan]TREND[/]"
+            elif regime_val == "HIGH_VOLATILITY":
+                regime_str = "[red]HI_VOL[/]"
+            elif regime_val == "RANGE":
+                regime_str = "[yellow]RANGE[/]"
+            else:
+                regime_str = "[dim]?[/]"
+            if size_scale < 1.0:
+                regime_str += f"[dim] {size_scale:.0%}[/]"
+
             table.add_row(
                 stats["symbol"],
                 str(stats["cycles"]),
                 "[green]YES[/]" if stats["ml_trained"] else "[yellow]NO[/]",
+                regime_str,
                 f"{stats.get('conf_threshold', 0.42):.0%}",
                 side_str,
                 entry_str,

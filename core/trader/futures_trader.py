@@ -66,6 +66,7 @@ from core.exchange.base_exchange import OrderSide, PositionInfo
 from core.models.hybrid_model import HybridModel
 from core.models.base_model import Signal
 from core.risk.risk_manager import RiskManager, TradeParameters
+from core.market.regime_detector import RegimeDetector, RegimeResult, Regime
 from data.indicators import ohlcv_to_dataframe, add_all_indicators
 from config.logger import get_logger
 
@@ -151,8 +152,15 @@ class FuturesTrader:
         self._entry_bar:     Optional[int]   = None
         self._sl_distance:   Optional[float] = None
 
-        self._cooldown_until_bar: int = 0
-        self._closed_on_bar:      int = -1  # bar when last position closed
+        self._cooldown_until_bar:          int   = 0
+        self._closed_on_bar:               int   = -1
+        self._entry_regime_early_profit_r: float = self.EARLY_PROFIT_THRESHOLD_R
+
+        # ── Market regime detector ─────────────────────────────────────────
+        # One instance per symbol. Maintains rolling regime history so a single
+        # noisy bar cannot flip all strategy parameters.
+        self._regime_detector = RegimeDetector(symbol=symbol)
+        self._last_regime:     Optional[RegimeResult] = None
 
         self._check_model_freshness()
 
@@ -202,11 +210,18 @@ class FuturesTrader:
         return self._bar_counter < self._cooldown_until_bar
 
     def _compute_atr_tpsl(
-        self, entry_price: float, side: OrderSide, atr: float
+        self, entry_price: float, side: OrderSide, atr: float,
+        sl_mult: Optional[float] = None,
+        tp_mult: Optional[float] = None,
     ) -> tuple[float, float]:
-        sym     = _normalize_symbol(self.symbol)
-        sl_mult = ATR_SL_MULT.get(sym, 1.5)
-        tp_mult = ATR_TP_MULT.get(sym, 3.0)
+        """
+        Compute TP/SL prices from ATR.
+        sl_mult / tp_mult override symbol defaults when provided by regime detector.
+        """
+        if sl_mult is None or tp_mult is None:
+            sym     = _normalize_symbol(self.symbol)
+            sl_mult = sl_mult if sl_mult is not None else ATR_SL_MULT.get(sym, 1.5)
+            tp_mult = tp_mult if tp_mult is not None else ATR_TP_MULT.get(sym, 3.0)
         if side == OrderSide.LONG:
             sl = round(entry_price - sl_mult * atr, 4)
             tp = round(entry_price + tp_mult * atr, 4)
@@ -307,6 +322,19 @@ class FuturesTrader:
             current_price = float(df["close"].iloc[-1])
             current_atr   = float(df["atr"].iloc[-1]) if "atr" in df.columns else None
 
+            # ── Detect market regime ───────────────────────────────────────────
+            # Run every cycle so parameters stay current even while in a position.
+            sym_key    = _normalize_symbol(self.symbol)
+            base_sl    = ATR_SL_MULT.get(sym_key, 1.5)
+            base_tp    = ATR_TP_MULT.get(sym_key, 3.0)
+            base_conf  = CONF_THRESHOLDS.get(sym_key, 0.42)
+            regime     = self._regime_detector.detect(
+                df, base_sl_mult=base_sl,
+                base_tp_mult=base_tp,
+                base_conf_threshold=base_conf,
+            )
+            self._last_regime = regime
+
             # ── Check existing position ────────────────────────────────────────
             positions   = await self.exchange.get_open_positions()
             current_pos = self._find_my_position(positions)
@@ -354,25 +382,37 @@ class FuturesTrader:
                 logger.info(f"[HOLD] {self.symbol}")
                 return
 
-            # ── Agreement filter ───────────────────────────────────────────────
+            # ── Agreement filter (regime-aware) ────────────────────────────────
             # SPLIT means ML and technical models disagree on direction.
-            # Paper trading showed SPLIT signals at 70-76% confidence
-            # consistently ran against the position while AGREE at 89%+ did not.
-            if self.REQUIRE_AGREEMENT and not prediction.models_agree:
+            # regime.require_agree is True in TRENDING regime — ADX being high
+            # does not tell you direction. A SPLIT SHORT in an ADX-trending market
+            # could easily be a counter-trend fade (as seen with SOL on Mar 16).
+            # This must be blocked even when global REQUIRE_AGREEMENT is False.
+            regime_requires_agree = regime is not None and regime.require_agree
+            effective_require_agree = self.REQUIRE_AGREEMENT or regime_requires_agree
+
+            if effective_require_agree and not prediction.models_agree:
+                reason = ("TRENDING regime forces AGREE" if regime_requires_agree
+                          else "global REQUIRE_AGREEMENT=True")
                 logger.info(
                     f"[SKIP:SPLIT] {self.symbol} — "
-                    f"ML and technical models disagree. "
-                    f"Signal={prediction.signal.value} conf={prediction.confidence:.0%}. "
-                    f"Set REQUIRE_AGREEMENT=False to trade SPLIT signals."
+                    f"ML and technical models disagree ({reason}). "
+                    f"Signal={prediction.signal.value} conf={prediction.confidence:.0%} "
+                    f"regime={regime.regime.value if regime else 'unknown'}."
                 )
                 return
 
-            # ── Confidence gate ────────────────────────────────────────────────
-            conf_threshold = self._get_conf_threshold()
+            # ── Confidence gate (regime-adjusted) ─────────────────────────────
+            # TRENDING now RAISES threshold (not lowers). RANGE raises it too.
+            # See regime_detector.py _REGIME_PARAMS for the reasoning.
+            conf_threshold = (regime.confidence_threshold
+                              if regime is not None
+                              else self._get_conf_threshold())
             if prediction.confidence < conf_threshold:
                 logger.info(
                     f"[SKIP:CONF] {self.symbol} — "
-                    f"conf {prediction.confidence:.0%} < {conf_threshold:.0%}"
+                    f"conf {prediction.confidence:.0%} < {conf_threshold:.0%} "
+                    f"(regime={regime.regime.value if regime else 'unknown'})"
                 )
                 return
 
@@ -397,7 +437,7 @@ class FuturesTrader:
                 return
 
             await self._open_new_trade(side, current_price, current_atr,
-                                       balance, positions)
+                                       balance, positions, regime)
 
         except Exception as e:
             logger.error(f"Cycle error {self.symbol}: {e}", exc_info=True)
@@ -470,11 +510,12 @@ class FuturesTrader:
         if bars_held < self.MIN_HOLD_BARS:
             return False
 
-        # 3. Early profit capture
-        if current_r >= self.EARLY_PROFIT_THRESHOLD_R:
+        # 3. Early profit capture (threshold locked in at entry from regime)
+        early_r_threshold = self._entry_regime_early_profit_r
+        if current_r >= early_r_threshold:
             logger.info(
                 f"[EARLY PROFIT] {self.symbol} — "
-                f"R={current_r:+.2f} >= {self.EARLY_PROFIT_THRESHOLD_R:.1f}R | "
+                f"R={current_r:+.2f} >= {early_r_threshold:.2f}R | "
                 f"PnL={pos.unrealized_pnl:+.4f} USDT. Closing."
             )
             return await self._close_position(pos, "EARLY_PROFIT")
@@ -586,7 +627,26 @@ class FuturesTrader:
 
     async def _open_new_trade(self, side: OrderSide, current_price: float,
                               current_atr: Optional[float],
-                              balance, positions) -> None:
+                              balance, positions,
+                              regime: Optional[RegimeResult] = None) -> None:
+        """
+        Open a new position with regime-adjusted parameters.
+
+        Regime affects three things:
+          1. TP/SL multipliers → different ATR multiples per regime
+          2. Position size     → HIGH_VOLATILITY reduces size by position_size_scale
+          3. Early profit R    → TRENDING holds longer, RANGE exits faster
+             (stored on self._entry_regime_early_profit_r for use in monitoring)
+        Portfolio cap and cooldown are applied AFTER sizing so they always hold.
+        """
+        # ── Regime-adjusted ATR multipliers ───────────────────────────────────
+        sym_key = _normalize_symbol(self.symbol)
+        if regime is not None:
+            sl_mult = regime.atr_sl_mult
+            tp_mult = regime.atr_tp_mult
+        else:
+            sl_mult = ATR_SL_MULT.get(sym_key, 1.5)
+            tp_mult = ATR_TP_MULT.get(sym_key, 3.0)
 
         trade_params = self.risk.calculate_trade(
             symbol      = self.symbol,
@@ -605,17 +665,42 @@ class FuturesTrader:
             return
 
         if current_atr and current_atr > 0:
-            tp_atr, sl_atr = self._compute_atr_tpsl(current_price, side, current_atr)
+            # Use regime-adjusted multipliers instead of fixed symbol defaults
+            tp_atr, sl_atr = self._compute_atr_tpsl(
+                current_price, side, current_atr,
+                sl_mult=sl_mult, tp_mult=tp_mult,
+            )
             trade_params.take_profit = tp_atr
             trade_params.stop_loss   = sl_atr
             sl_distance = abs(current_price - sl_atr)
+            regime_label = regime.regime.value if regime else "default"
             logger.info(
                 f"[ATR TP/SL] {self.symbol}: ATR={current_atr:.4f} | "
-                f"TP={tp_atr:.4f}  SL={sl_atr:.4f}"
+                f"TP={tp_atr:.4f}  SL={sl_atr:.4f} | "
+                f"sl_mult={sl_mult:.2f}x  tp_mult={tp_mult:.2f}x  "
+                f"[{regime_label}]"
             )
         else:
             sl_distance = abs(current_price - trade_params.stop_loss)
             logger.warning(f"[NO ATR] {self.symbol}: using fixed-% TP/SL fallback")
+
+        # ── Regime-adjusted position size ─────────────────────────────────────
+        # HIGH_VOLATILITY regime scales down the Kelly quantity.
+        # Applied BEFORE the portfolio cap check so the cap still functions correctly.
+        if regime is not None and regime.position_size_scale != 1.0:
+            original_qty  = trade_params.quantity
+            scaled_qty    = max(0.001, original_qty * regime.position_size_scale)
+            # Round to 3 decimal places (Binance minimum lot step)
+            import math
+            scaled_qty    = math.floor(scaled_qty * 1000) / 1000
+            if scaled_qty > 0:
+                trade_params.quantity         = scaled_qty
+                trade_params.risk_amount_usdt *= regime.position_size_scale
+                logger.info(
+                    f"[SIZE SCALE] {self.symbol}: {original_qty} → {scaled_qty} "
+                    f"({regime.position_size_scale:.0%} scale, "
+                    f"regime={regime.regime.value})"
+                )
 
         if not self._portfolio_risk_ok(trade_params.risk_amount_usdt,
                                        balance.available_balance):
@@ -626,6 +711,12 @@ class FuturesTrader:
         if self._portfolio_tracker is not None:
             self._portfolio_tracker.register_open(
                 self.symbol, trade_params.risk_amount_usdt)
+
+        # Store regime's early-profit threshold so monitoring uses it
+        self._entry_regime_early_profit_r = (
+            regime.early_profit_r if regime is not None
+            else self.EARLY_PROFIT_THRESHOLD_R
+        )
 
         await self._execute_trade(trade_params, sl_distance)
 
@@ -674,14 +765,15 @@ class FuturesTrader:
     # ── State management ──────────────────────────────────────────────────────
 
     def _reset_position_state(self):
-        self._closed_on_bar = self._bar_counter  # record when we closed
-        self._in_position   = False
-        self._tp_price      = None
-        self._sl_price      = None
-        self._position_side = None
-        self._entry_price   = None
-        self._entry_bar     = None
-        self._sl_distance   = None
+        self._closed_on_bar                = self._bar_counter
+        self._in_position                  = False
+        self._tp_price                     = None
+        self._sl_price                     = None
+        self._position_side                = None
+        self._entry_price                  = None
+        self._entry_bar                    = None
+        self._sl_distance                  = None
+        self._entry_regime_early_profit_r  = self.EARLY_PROFIT_THRESHOLD_R
 
     async def train_ml_model(self, candle_limit: int = 2000):
         candles = await self.exchange.get_ohlcv(
@@ -696,6 +788,7 @@ class FuturesTrader:
         logger.info(f"Trader stopped: {self.symbol}")
 
     def get_stats(self) -> dict:
+        regime = self._last_regime
         return {
             "symbol":                  self.symbol,
             "cycles":                  self._cycles,
@@ -706,11 +799,17 @@ class FuturesTrader:
             "entry":                   self._entry_price,
             "bars_held":               self._bars_held(),
             "ml_trained":              self.model.ml_is_trained,
-            "conf_threshold":          self._get_conf_threshold(),
+            "conf_threshold":          (regime.confidence_threshold
+                                        if regime else self._get_conf_threshold()),
             "require_agreement":       self.REQUIRE_AGREEMENT,
-            "early_profit_threshold":  self.EARLY_PROFIT_THRESHOLD_R,
+            "early_profit_threshold":  self._entry_regime_early_profit_r,
             "in_cooldown":             self._in_cooldown(),
             "cooldown_bars_left":      max(0, self._cooldown_until_bar - self._bar_counter),
+            # Regime fields
+            "regime":                  regime.regime.value if regime else "UNKNOWN",
+            "regime_adx":              round(regime.adx, 1) if regime else 0.0,
+            "regime_atr_ratio":        round(regime.atr_ratio, 2) if regime else 0.0,
+            "regime_size_scale":       regime.position_size_scale if regime else 1.0,
         }
 
 

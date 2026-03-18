@@ -289,10 +289,15 @@ def build_ensemble(X_train, y_train, X_val, y_val, n_features: int):
             callbacks      = [lgbm.early_stopping(50, verbose=False),
                               lgbm.log_evaluation(-1)],
         )
-        lgb_cal = CalibratedClassifierCV(lgb_model, method="isotonic", cv="prefit")
+        # Use sigmoid (Platt scaling) not isotonic.
+        # Isotonic regression on tree ensemble outputs with small validation sets
+        # saturates to extreme 0/1 probabilities → produces 98% confidence readings
+        # that are meaningless for trading decisions. Sigmoid is monotonic and
+        # regularized, producing well-calibrated probabilities in the 0.4–0.7 range.
+        lgb_cal = CalibratedClassifierCV(lgb_model, method="sigmoid", cv="prefit")
         lgb_cal.fit(X_val, y_val)
         models.append(("lgbm", lgb_cal, 0.55))
-        logger.info("[HIST] LightGBM trained + calibrated")
+        logger.info("[HIST] LightGBM trained + calibrated (sigmoid)")
     except Exception as e:
         logger.warning(f"[HIST] LightGBM failed: {e}")
 
@@ -321,10 +326,10 @@ def build_ensemble(X_train, y_train, X_val, y_val, n_features: int):
             eval_set               = [(X_val, y_val)],
             verbose                = False,
         )
-        xgb_cal = CalibratedClassifierCV(xgb_model, method="isotonic", cv="prefit")
+        xgb_cal = CalibratedClassifierCV(xgb_model, method="sigmoid", cv="prefit")
         xgb_cal.fit(X_val, y_val)
         models.append(("xgb", xgb_cal, 0.45))
-        logger.info("[HIST] XGBoost trained + calibrated")
+        logger.info("[HIST] XGBoost trained + calibrated (sigmoid)")
     except Exception as e:
         logger.warning(f"[HIST] XGBoost failed: {e}")
 
@@ -370,9 +375,9 @@ def train_symbol_from_history(symbol: str, dry_run: bool = False) -> dict:
     result["date_range"] = f"{df_15m.index[0].strftime('%Y-%m-%d')} → {df_15m.index[-1].strftime('%Y-%m-%d')}"
 
     print(f"  15m: {bars_15m:,} bars  |  {days} days  |  {result['date_range']}")
-    if df_1h is not None and not df_1h.empty:
+    if df_1h is not None:
         print(f"  1h:  {len(df_1h):,} bars")
-    if df_4h is not None and not df_4h.empty:
+    if df_4h is not None:
         print(f"  4h:  {len(df_4h):,} bars")
 
     if dry_run:
@@ -418,8 +423,6 @@ def train_symbol_from_history(symbol: str, dry_run: bool = False) -> dict:
     valid_mask = feat_df.notna().all(axis=1)
     feat_df    = feat_df[valid_mask]
     labels     = labels[valid_mask.values]
-    prices = df_15m["close"].iloc[:-FUTURE_BARS][valid_mask].values
-
 
     n_samples  = len(feat_df)
     n_features = feat_df.shape[1]
@@ -432,16 +435,22 @@ def train_symbol_from_history(symbol: str, dry_run: bool = False) -> dict:
 
     dist = label_distribution(labels)
     result["label_dist"] = dist
+    hold_pct  = dist["HOLD"]  / dist["total"]
+    long_pct  = dist["LONG"]  / dist["total"]
+    short_pct = dist["SHORT"] / dist["total"]
     print(f"  Samples: {n_samples:,}  |  Features: {n_features}")
-    print(f"  Labels: HOLD={dist.get(0,0):.1%}  LONG={dist.get(1,0):.1%}  SHORT={dist.get(2,0):.1%}")
+    print(f"  Labels:  HOLD={hold_pct:.1%}  LONG={long_pct:.1%}  SHORT={short_pct:.1%}")
 
     # Scale features
     scaler = RobustScaler()
     X = scaler.fit_transform(feat_df.values.astype(np.float32))
     y = labels.astype(int)
-    prices = df_15m["close"].iloc[:-FUTURE_BARS][valid_mask].values[:-FUTURE_BARS] \
-             if len(df_15m["close"].values) > len(labels) + FUTURE_BARS \
-             else df_15m["close"].values[:n_samples]
+    # prices must be aligned to the same rows as X and y.
+    # valid_mask was computed on feat_df.iloc[:-FUTURE_BARS], which has
+    # len(df_15m) - FUTURE_BARS rows. df_15m itself has FUTURE_BARS more rows,
+    # so we must trim df_15m first before applying valid_mask as a boolean index.
+    close_trimmed = df_15m["close"].values[:-FUTURE_BARS]   # align to feat_df
+    prices = close_trimmed[valid_mask.values]               # apply NaN mask
 
     # ── Walk-forward validation ────────────────────────────────────────────────
     print(f"\n  Walk-forward validation ({N_WF_SPLITS} folds)...")
