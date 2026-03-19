@@ -391,8 +391,8 @@ class FuturesTrader:
         else:
             logger.error(f"[CLOSE FAILED] {self.symbol}: {result.message}")
 
-        # Deregister from portfolio tracker
-        self.risk.portfolio.register_close(self.symbol)
+        # Deregister from portfolio tracker (pass win/loss for streak guard)
+        self.risk.portfolio.register_close(self.symbol, profit=(pnl >= 0))
 
         self._reset_position_state()
         # Start cooldown to prevent immediate re-entry

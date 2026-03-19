@@ -167,6 +167,9 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct, interval):
 
     while _running:
         try:
+            # Advance cooldown timers before running cycles
+            risk_manager.tick()
+
             await asyncio.gather(
                 *[t.run_cycle() for t in _traders],
                 return_exceptions=True

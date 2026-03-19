@@ -1,36 +1,28 @@
 """
 core/risk/risk_manager.py
 ──────────────────────────
-Risk management — position sizing, TP/SL calculation, daily loss limits.
+Risk management — position sizing, ATR-based TP/SL, daily loss limits,
+directional concentration filter, and directional loss-streak guard.
 
-FIX #4 — ATR-based TP/SL (replaces fixed percentage)
-------------------------------------------------------
-Problem: TP=2%, SL=1% are fixed percentages that ignore actual market
-volatility.  During high-ATR sessions BTC moves 1% in 2 candles, so the
-1% SL is hit almost immediately, and the 2% TP is never reached before the
-32-bar timeout.  Almost all closes are TIMEOUTs instead of TP/SL hits.
+Directional limit:
+    MAX_SAME_DIRECTION = 1  — at most 1 LONG and 1 SHORT open at once.
+    This prevents 2×SHORT exposure even when both signals fire AGREE on the
+    same cycle. The second same-direction signal is simply skipped.
 
-Solution: TP and SL are now expressed as ATR multiples:
-    SL = entry ± (ATR * SL_ATR_MULT)   default: 2.0×ATR
-    TP = entry ± (ATR * TP_ATR_MULT)   default: 3.0×ATR  (1.5 R:R minimum)
+Loss-streak guard (new):
+    If the last STREAK_BLOCK_COUNT closed trades in a given direction were
+    ALL losses, block new entries in that direction for STREAK_COOLDOWN_BARS
+    cycles. Prevents the model doubling down on a direction that's clearly
+    wrong for current market conditions.
 
-The regime detector can further scale these multipliers via RegimeParams.
-
-FIX #5 — Directional concentration filter
-------------------------------------------
-Problem: all 4 pairs open SHORT simultaneously — full correlated exposure.
-
-Solution: PortfolioDirectionTracker counts open LONG/SHORT positions.
-If adding this trade would put more than MAX_SAME_DIRECTION positions in
-the same direction, the trade is rejected.  Default limit: 2.
-This means the bot can hold BTC SHORT + ETH SHORT, but a third SHORT on
-BNB will be blocked until one of the others closes.
+    Default: 3 consecutive losses → 8-bar cooldown on that direction.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, Optional
+from collections import deque
+from dataclasses import dataclass
+from typing import Deque, Dict, Optional, Tuple
 import math
 
 from core.exchange.base_exchange import AccountBalance, OrderSide
@@ -54,50 +46,107 @@ class TradeParameters:
     stop_loss:          float
     position_size_usdt: float
     risk_amount_usdt:   float
-    approved:           bool  = True
-    reject_reason:      str   = ""
+    approved:           bool = True
+    reject_reason:      str  = ""
 
 
 # ── Directional portfolio tracker ─────────────────────────────────────────────
 
 class PortfolioDirectionTracker:
     """
-    Tracks how many open positions are LONG vs SHORT.
+    Enforces directional diversification across all open positions.
 
-    Call register_open()  when a trade executes.
-    Call register_close() when a position closes.
-    Call can_open()       before placing a new trade.
+    MAX_SAME_DIRECTION = 1 means:
+      • 1 SHORT allowed at any time
+      • 1 LONG allowed at any time
+      • Never 2 SHORTs or 2 LONGs simultaneously
+
+    Also tracks a per-direction loss streak and blocks new entries in a
+    direction after STREAK_BLOCK_COUNT consecutive losses until cooldown clears.
     """
 
-    # Maximum same-direction positions at once (FIX #5)
-    MAX_SAME_DIRECTION = 2
+    MAX_SAME_DIRECTION  = 1     # reduced from 2
+    STREAK_BLOCK_COUNT  = 3     # consecutive losses before direction is blocked
+    STREAK_COOLDOWN_BARS = 8    # bars to wait after streak block triggered
 
     def __init__(self):
-        self._positions: Dict[str, OrderSide] = {}   # symbol → side
+        self._positions: Dict[str, OrderSide] = {}
+
+        # Recent trade outcomes per direction: True=win, False=loss
+        self._outcomes: Dict[str, Deque[bool]] = {
+            "long":  deque(maxlen=self.STREAK_BLOCK_COUNT),
+            "short": deque(maxlen=self.STREAK_BLOCK_COUNT),
+        }
+
+        # Cooldown remaining (in bars) per direction
+        self._direction_cooldown: Dict[str, int] = {"long": 0, "short": 0}
+
+    def tick(self):
+        """Call once per cycle to decrement directional cooldowns."""
+        for d in self._direction_cooldown:
+            if self._direction_cooldown[d] > 0:
+                self._direction_cooldown[d] -= 1
+                if self._direction_cooldown[d] == 0:
+                    logger.info(f"[DIRECTION] {d.upper()} cooldown lifted — entries allowed again")
 
     def register_open(self, symbol: str, side: OrderSide):
         self._positions[symbol] = side
+        direction = side.value
         logger.info(
-            f"[PORTFOLIO] {symbol} registered {side.value} | "
+            f"[PORTFOLIO] {symbol} registered {direction} | "
             f"LONG={self._count(OrderSide.LONG)}  SHORT={self._count(OrderSide.SHORT)}"
         )
 
-    def register_close(self, symbol: str):
-        self._positions.pop(symbol, None)
+    def register_close(self, symbol: str, profit: bool):
+        """
+        Record a closed trade.
+        profit=True for winners, False for losses (including breakeven-ish timeouts).
+        """
+        side = self._positions.pop(symbol, None)
+        if side is None:
+            return
+
+        direction = side.value
+        self._outcomes[direction].append(profit)
+
+        # Check for loss streak
+        outcomes = list(self._outcomes[direction])
+        if (
+            len(outcomes) >= self.STREAK_BLOCK_COUNT
+            and not any(outcomes[-self.STREAK_BLOCK_COUNT:])
+        ):
+            logger.warning(
+                f"[DIRECTION BLOCK] {direction.upper()} — "
+                f"{self.STREAK_BLOCK_COUNT} consecutive losses. "
+                f"Blocking {direction} entries for {self.STREAK_COOLDOWN_BARS} bars."
+            )
+            self._direction_cooldown[direction] = self.STREAK_COOLDOWN_BARS
+
         logger.info(
-            f"[PORTFOLIO] {symbol} deregistered | "
+            f"[PORTFOLIO] {symbol} deregistered ({'WIN' if profit else 'LOSS'}) | "
             f"LONG={self._count(OrderSide.LONG)}  SHORT={self._count(OrderSide.SHORT)}"
         )
 
-    def can_open(self, side: OrderSide) -> tuple[bool, str]:
+    def can_open(self, side: OrderSide) -> Tuple[bool, str]:
         """Return (allowed, reason_if_not)."""
+        direction = side.value
+
+        # Check loss-streak cooldown
+        cooldown = self._direction_cooldown[direction]
+        if cooldown > 0:
+            return False, (
+                f"{direction.upper()} entries blocked after loss streak "
+                f"({cooldown} bars remaining)"
+            )
+
+        # Check positional concentration
         current = self._count(side)
         if current >= self.MAX_SAME_DIRECTION:
-            direction = "LONG" if side == OrderSide.LONG else "SHORT"
             return False, (
-                f"Already {current} {direction} positions open "
+                f"Already {current} {direction.upper()} position(s) open "
                 f"(max {self.MAX_SAME_DIRECTION})"
             )
+
         return True, ""
 
     def _count(self, side: OrderSide) -> int:
@@ -114,26 +163,26 @@ class RiskManager:
     """
     Calculates safe position sizes and validates trade parameters.
 
-    TP/SL mode:
-        If atr is provided → ATR-based levels (preferred).
-        Otherwise          → fixed percentage fallback.
-
-    Key ATR multipliers (can be scaled by regime):
-        SL_ATR_MULT  = 2.0   (stop 2 ATR away from entry)
-        TP_ATR_MULT  = 3.0   (target 3 ATR away — 1.5 R:R)
+    TP/SL: ATR-based when atr is provided (preferred), fixed-pct fallback.
+        SL = entry ± (ATR × sl_atr_mult)    default 2.0×ATR
+        TP = entry ± (ATR × tp_atr_mult)    default 3.0×ATR  → 1.5 R:R
     """
 
     SL_ATR_MULT = 2.0
     TP_ATR_MULT = 3.0
 
     def __init__(self, risk_settings: RiskSettings):
-        self.settings              = risk_settings
-        self._daily_loss_usdt      = 0.0
+        self.settings               = risk_settings
+        self._daily_loss_usdt       = 0.0
         self._session_start_balance = 0.0
-        self.portfolio             = PortfolioDirectionTracker()
+        self.portfolio              = PortfolioDirectionTracker()
 
     def set_session_balance(self, balance: float):
         self._session_start_balance = balance
+
+    def tick(self):
+        """Call once per main loop cycle to advance cooldown timers."""
+        self.portfolio.tick()
 
     def record_loss(self, loss_usdt: float):
         if loss_usdt < 0:
@@ -147,48 +196,39 @@ class RiskManager:
     def is_daily_limit_hit(self, balance: AccountBalance) -> bool:
         if self._session_start_balance <= 0:
             return False
-        daily_loss_pct = (self._daily_loss_usdt / self._session_start_balance) * 100
-        limit          = self.settings.max_daily_loss_pct
-        if daily_loss_pct >= limit:
+        pct = (self._daily_loss_usdt / self._session_start_balance) * 100
+        if pct >= self.settings.max_daily_loss_pct:
             logger.error(
-                f"Daily loss limit hit: {daily_loss_pct:.1f}% >= {limit}% — "
-                f"stopping all trades"
+                f"Daily loss limit hit: {pct:.1f}% >= {self.settings.max_daily_loss_pct}% "
+                f"— stopping all trades"
             )
             return True
         return False
 
     def calculate_trade(
         self,
-        symbol:       str,
-        side:         OrderSide,
-        entry_price:  float,
-        balance:      AccountBalance,
-        open_trades:  int              = 0,
-        # ATR for dynamic TP/SL (FIX #4)
-        atr:          Optional[float]  = None,
-        # Regime multipliers (from RegimeParams)
-        sl_atr_mult:  Optional[float]  = None,
-        tp_atr_mult:  Optional[float]  = None,
-        size_scale:   float            = 1.0,
-        # Legacy fixed-pct overrides (fallback only)
-        leverage:     Optional[int]    = None,
-        tp_pct:       Optional[float]  = None,
-        sl_pct:       Optional[float]  = None,
-        risk_pct:     Optional[float]  = None,
+        symbol:      str,
+        side:        OrderSide,
+        entry_price: float,
+        balance:     AccountBalance,
+        open_trades: int           = 0,
+        atr:         Optional[float] = None,
+        sl_atr_mult: Optional[float] = None,
+        tp_atr_mult: Optional[float] = None,
+        size_scale:  float           = 1.0,
+        leverage:    Optional[int]   = None,
+        tp_pct:      Optional[float] = None,
+        sl_pct:      Optional[float] = None,
+        risk_pct:    Optional[float] = None,
     ) -> TradeParameters:
-        """
-        Calculate all parameters for a trade.
-        Returns TradeParameters with approved=False if any check fails.
-        """
+
         lev   = leverage or self.settings.leverage
         r_pct = risk_pct or self.settings.risk_per_trade_pct
 
-        # ── Pre-trade checks ───────────────────────────────────────────────
+        # ── Pre-trade checks ──────────────────────────────────────────────
         if open_trades >= self.settings.max_open_trades:
-            return self._reject(
-                symbol, side, entry_price,
-                f"Max open trades ({self.settings.max_open_trades}) reached",
-            )
+            return self._reject(symbol, side, entry_price,
+                                f"Max open trades ({self.settings.max_open_trades}) reached")
 
         if balance.available_balance <= 0:
             return self._reject(symbol, side, entry_price, "No available balance")
@@ -196,12 +236,11 @@ class RiskManager:
         if self.is_daily_limit_hit(balance):
             return self._reject(symbol, side, entry_price, "Daily loss limit hit")
 
-        # FIX #5 — directional concentration check
         ok, reason = self.portfolio.can_open(side)
         if not ok:
             return self._reject(symbol, side, entry_price, reason)
 
-        # ── Position sizing ────────────────────────────────────────────────
+        # ── Position sizing ───────────────────────────────────────────────
         risk_amount   = balance.available_balance * (r_pct / 100) * size_scale
         position_usdt = risk_amount * lev
         quantity      = self._round_quantity(position_usdt / entry_price)
@@ -209,7 +248,7 @@ class RiskManager:
         if quantity <= 0:
             return self._reject(symbol, side, entry_price, "Calculated quantity is 0")
 
-        # ── TP/SL: ATR-based preferred, fixed-pct fallback ────────────────
+        # ── ATR-based TP/SL ───────────────────────────────────────────────
         sl_m = sl_atr_mult or self.SL_ATR_MULT
         tp_m = tp_atr_mult or self.TP_ATR_MULT
 
@@ -223,7 +262,6 @@ class RiskManager:
                 take_profit = round(entry_price - tp_dist, 4)
                 stop_loss   = round(entry_price + sl_dist, 4)
         else:
-            # Legacy percentage fallback
             tp = tp_pct or self.settings.take_profit_pct
             sl = sl_pct or self.settings.stop_loss_pct
             if side == OrderSide.LONG:
@@ -239,15 +277,10 @@ class RiskManager:
         )
 
         return TradeParameters(
-            symbol=symbol,
-            side=side,
-            quantity=quantity,
-            leverage=lev,
-            entry_price=entry_price,
-            take_profit=take_profit,
-            stop_loss=stop_loss,
-            position_size_usdt=position_usdt,
-            risk_amount_usdt=risk_amount,
+            symbol=symbol, side=side, quantity=quantity,
+            leverage=lev, entry_price=entry_price,
+            take_profit=take_profit, stop_loss=stop_loss,
+            position_size_usdt=position_usdt, risk_amount_usdt=risk_amount,
             approved=True,
         )
 
