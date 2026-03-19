@@ -3,9 +3,8 @@ scripts/run_bot.py — Main entry point.
 
 Usage:
     python scripts/run_bot.py
-    python scripts/run_bot.py --pairs BTCUSDT ETHUSDT --leverage 10 --tp 2.0 --sl 1.0
+    python scripts/run_bot.py --pairs BTCUSDT ETHUSDT --leverage 10
     python scripts/run_bot.py --train
-    python scripts/run_bot.py --no-agreement-filter   # trade SPLIT signals too
 """
 
 import asyncio
@@ -21,9 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.exchange.exchange_factory import create_exchange
 from core.risk.risk_manager import RiskManager
 from core.strategy.recovery_strategy import RecoveryStrategy
-from core.trader.futures_trader import (
-    FuturesTrader, PortfolioRiskTracker, EntryGate, _normalize_symbol
-)
+from core.trader.futures_trader import FuturesTrader, _normalize_symbol
 from config.settings import settings, RiskSettings
 from config.logger import get_logger
 from rich.console import Console
@@ -48,9 +45,7 @@ signal.signal(signal.SIGINT,  signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 
-async def print_dashboard(exchange, traders: List[FuturesTrader],
-                          portfolio_tracker: PortfolioRiskTracker,
-                          entry_gate: EntryGate):
+async def print_dashboard(exchange, traders: List[FuturesTrader]):
     try:
         balance   = await exchange.get_balance()
         positions = await exchange.get_open_positions()
@@ -67,7 +62,6 @@ async def print_dashboard(exchange, traders: List[FuturesTrader],
         table.add_column("Cycles",    justify="right")
         table.add_column("ML",        justify="center")
         table.add_column("Regime",    justify="center")
-        table.add_column("Threshold", justify="center")
         table.add_column("Side",      justify="center")
         table.add_column("Entry",     justify="right")
         table.add_column("TP / SL",   justify="center")
@@ -75,24 +69,18 @@ async def print_dashboard(exchange, traders: List[FuturesTrader],
         table.add_column("PnL",       justify="right")
 
         for t in traders:
-            stats = t.get_stats()
-            pos   = pos_map.get(_normalize_symbol(t.symbol))
+            stats  = t.get_stats()
+            pos    = pos_map.get(_normalize_symbol(t.symbol))
+            regime = stats.get("regime", "?")
 
             if pos:
-                side_str  = "[green]LONG[/]" if pos.side.value == "long" else "[red]SHORT[/]"
+                side_str  = "[green]LONG[/]"  if pos.side.value == "long" else "[red]SHORT[/]"
                 entry_str = f"{pos.entry_price:.2f}"
                 pnl_val   = pos.unrealized_pnl
-                pnl_str   = (f"[green]+{pnl_val:.4f}[/]" if pnl_val >= 0
-                             else f"[red]{pnl_val:.4f}[/]")
+                pnl_str   = f"[green]+{pnl_val:.4f}[/]" if pnl_val >= 0 else f"[red]{pnl_val:.4f}[/]"
                 tp_sl_str = (f"{stats['tp']:.2f} / {stats['sl']:.2f}"
-                             if stats["tp"] else "recovering...")
+                             if stats["tp"] else "—")
                 bars_str  = str(stats.get("bars_held", 0))
-            elif stats.get("in_cooldown"):
-                side_str  = "[yellow]COOLDOWN[/]"
-                entry_str = "—"
-                pnl_str   = "—"
-                tp_sl_str = f"wait {stats['cooldown_bars_left']}b"
-                bars_str  = "—"
             else:
                 side_str  = "[dim]Watching[/]"
                 entry_str = "—"
@@ -100,27 +88,11 @@ async def print_dashboard(exchange, traders: List[FuturesTrader],
                 tp_sl_str = "—"
                 bars_str  = "—"
 
-            # Regime display
-            regime_val = stats.get("regime", "UNKNOWN")
-            atr_ratio  = stats.get("regime_atr_ratio", 1.0)
-            size_scale = stats.get("regime_size_scale", 1.0)
-            if regime_val == "TRENDING":
-                regime_str = "[cyan]TREND[/]"
-            elif regime_val == "HIGH_VOLATILITY":
-                regime_str = "[red]HI_VOL[/]"
-            elif regime_val == "RANGE":
-                regime_str = "[yellow]RANGE[/]"
-            else:
-                regime_str = "[dim]?[/]"
-            if size_scale < 1.0:
-                regime_str += f"[dim] {size_scale:.0%}[/]"
-
             table.add_row(
                 stats["symbol"],
                 str(stats["cycles"]),
                 "[green]YES[/]" if stats["ml_trained"] else "[yellow]NO[/]",
-                regime_str,
-                f"{stats.get('conf_threshold', 0.42):.0%}",
+                f"[cyan]{regime}[/]",
                 side_str,
                 entry_str,
                 tp_sl_str,
@@ -142,50 +114,18 @@ async def print_dashboard(exchange, traders: List[FuturesTrader],
             f"Session PnL: [{total_color}]{total_pnl:+.2f} USDT[/]"
         )
 
-        port_status = portfolio_tracker.get_status()
-        open_risk   = port_status["total_risk_usdt"]
-        cap         = balance.available_balance * 0.03
-        risk_color  = ("red" if open_risk >= cap * 0.9
-                       else "yellow" if open_risk > 0 else "green")
-        open_pos_str = ", ".join(
-            f"{sym}={r:.2f}" for sym, r in port_status["by_symbol"].items()
-        ) or "none"
-        require_str = ("[green]AGREE-only[/]"
-                       if FuturesTrader.REQUIRE_AGREEMENT else "[yellow]SPLIT+AGREE[/]")
-
-        console.print(
-            f"  Portfolio risk: [{risk_color}]{open_risk:.2f} USDT open[/]  |  "
-            f"Cap: {cap:.2f} USDT (3%)  |  "
-            f"Entry filter: {require_str}  |  "
-            f"Max concurrent: {FuturesTrader.MAX_CONCURRENT_ENTRIES}  |  "
-            f"Positions: {open_pos_str}"
-        )
-
     except Exception as e:
         logger.warning(f"Dashboard error: {e}")
 
 
-async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct,
-                  interval, require_agreement):
+async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct, interval):
     global _traders, _running
-
-    # Apply agreement filter setting from CLI arg
-    FuturesTrader.REQUIRE_AGREEMENT = require_agreement
 
     console.rule("[bold cyan]AI Futures Trading Bot — Starting[/]")
     console.print(f"  Environment : [bold]{settings.environment.upper()}[/]")
     console.print(f"  Pairs       : {', '.join(pairs)}")
     console.print(f"  Leverage    : {leverage}x  |  TP: {tp_pct}%  |  SL: {sl_pct}%")
-    console.print(f"  Cycle every : {interval}s")
-    console.print(f"  Conf thresholds: BTC/BNB=42%  ETH/SOL=38%  (per-symbol)")
-    console.print(
-        f"  Entry filter: "
-        f"[green]AGREE-only[/]" if require_agreement
-        else f"[yellow]SPLIT+AGREE (all signals)[/]"
-    )
-    console.print(
-        f"  Max concurrent entries: {FuturesTrader.MAX_CONCURRENT_ENTRIES}/cycle\n"
-    )
+    console.print(f"  Cycle every : {interval}s\n")
 
     exchange  = create_exchange("binance")
     connected = await exchange.connect()
@@ -208,18 +148,10 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct,
     risk_manager.set_session_balance(balance.total_balance)
     console.print(f"  Starting balance: [bold green]{balance.total_balance:.2f} USDT[/]\n")
 
-    # ── Shared infrastructure ──────────────────────────────────────────────────
-    portfolio_tracker = PortfolioRiskTracker()
-    entry_gate        = EntryGate(max_per_cycle=FuturesTrader.MAX_CONCURRENT_ENTRIES)
-
     for symbol in pairs:
         trader = FuturesTrader(
-            exchange=exchange,
-            symbol=symbol,
-            risk_manager=risk_manager,
-            recovery_strategy=recovery,
-            portfolio_risk_tracker=portfolio_tracker,
-            entry_gate=entry_gate,               # ← NEW: limits concurrent entries
+            exchange=exchange, symbol=symbol,
+            risk_manager=risk_manager, recovery_strategy=recovery,
         )
         _traders.append(trader)
         logger.info(f"Trader ready: {symbol}")
@@ -235,14 +167,11 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct,
 
     while _running:
         try:
-            # Reset entry gate at the START of each cycle before any trader runs
-            entry_gate.reset()
-
             await asyncio.gather(
                 *[t.run_cycle() for t in _traders],
                 return_exceptions=True
             )
-            await print_dashboard(exchange, _traders, portfolio_tracker, entry_gate)
+            await print_dashboard(exchange, _traders)
 
             for _ in range(interval):
                 if not _running:
@@ -267,11 +196,6 @@ def parse_args():
     parser.add_argument("--sl",       type=float, default=settings.risk.stop_loss_pct)
     parser.add_argument("--risk",     type=float, default=settings.risk.risk_per_trade_pct)
     parser.add_argument("--interval", type=int,   default=60)
-    parser.add_argument(
-        "--no-agreement-filter", dest="require_agreement",
-        action="store_false", default=True,
-        help="Trade SPLIT signals too (default: AGREE-only)"
-    )
     return parser.parse_args()
 
 
@@ -282,5 +206,4 @@ if __name__ == "__main__":
         leverage=args.leverage, tp_pct=args.tp,
         sl_pct=args.sl, risk_pct=args.risk,
         interval=args.interval,
-        require_agreement=args.require_agreement,
     ))

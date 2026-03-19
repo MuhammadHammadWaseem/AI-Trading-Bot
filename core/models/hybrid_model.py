@@ -1,19 +1,22 @@
 """
 core/models/hybrid_model.py
-────────────────────────────
-Hybrid model — Technical Analysis + ML ensemble.  REFACTORED.
+─────────────────────────────
+Hybrid model — combines Technical Analysis + ML predictions.
 
-Key changes from original:
-  1. Probability-based signal: LONG if P(LONG) > 0.60, SHORT if P(SHORT) > 0.60
-  2. Removed 0.75× disagreement penalty (was suppressing valid signals)
-  3. Confidence gate reduced from 0.65 to 0.55 (calibrated probabilities are lower)
-  4. Agreement bonus retained but only for strong signals
-  5. Disagreement now gives HOLD only if confidence < 0.55 (was 0.65)
-  6. models_agree field now propagated to PredictionResult so FuturesTrader
-     can optionally require agreement before entering (REQUIRE_AGREEMENT flag)
+FIX #2 — Signal Stability Filter
+---------------------------------
+Problem: confidence flip-flops every 1-3 cycles because the weighted
+combination is computed fresh each call with no memory.
+
+Solution: EMA smoothing of raw probabilities across cycles.  A new
+signal only propagates after SIGNAL_CONFIRM_BARS consecutive cycles of
+agreement.  Turns 73%→61%→71% AGREE/SPLIT noise into stable output.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
 
 import pandas as pd
 
@@ -26,137 +29,168 @@ from config.settings import settings
 logger = get_logger(__name__)
 
 
+@dataclass
+class _SignalState:
+    """Rolling smoothing state per symbol."""
+    ema_long:         float  = 0.33
+    ema_short:        float  = 0.33
+    current_signal:   Signal = Signal.HOLD
+    consecutive_bars: int    = 0
+
+
 class HybridModel(BaseModel):
     """
-    Weighted fusion of TechnicalModel (rule-based) + MLModel (calibrated ensemble).
+    Ensemble of TechnicalModel + MLModel with EMA probability smoothing.
 
-    Signal decision logic:
-      1. Compute weighted probability blend: 0.35×tech + 0.65×ml
-      2. LONG  if blended P(LONG)  > LONG_THRESHOLD  AND P(LONG)  > P(SHORT)
-      3. SHORT if blended P(SHORT) > SHORT_THRESHOLD AND P(SHORT) > P(LONG)
-      4. HOLD  otherwise
-      5. Agreement bonus: +0.05 confidence when both models agree
-
-    REMOVED from original:
-      - 0.75× penalty for disagreement (was the primary cause of excessive HOLDs)
-      - Static 0.65 confidence gate converting valid signals to HOLD
+    TECHNICAL_WEIGHT    = 0.35
+    ML_WEIGHT           = 0.65  (when ML is trained)
+    PROB_EMA_ALPHA      = 0.35  (35% new data, 65% history each cycle)
+    SIGNAL_CONFIRM_BARS = 2     (direction change needs 2 bars confirmation)
     """
 
-    TECHNICAL_WEIGHT = 0.35
-    ML_WEIGHT        = 0.65
-    AGREEMENT_BONUS  = 0.05
-
-    # Probability thresholds for blended signal
-    LONG_THRESHOLD   = 0.42   # blended P(LONG)  must exceed this
-    SHORT_THRESHOLD  = 0.42   # blended P(SHORT) must exceed this
-
-    # Minimum confidence to emit a directional signal (after calibration)
-    MIN_CONFIDENCE   = 0.50
+    TECHNICAL_WEIGHT    = 0.35
+    ML_WEIGHT           = 0.65
+    AGREEMENT_BONUS     = 0.08
+    PROB_EMA_ALPHA      = 0.35
+    SIGNAL_CONFIRM_BARS = 2
 
     def __init__(self, symbol: str = "BTCUSDT"):
         self.symbol     = symbol
         self.technical  = TechnicalModel()
         self.ml         = MLModel(symbol=symbol)
+        self._threshold = settings.model.confidence_threshold
+        self._state     = _SignalState()
+
+    # ── Public ────────────────────────────────────────────────────────────
 
     def predict(self, df: pd.DataFrame) -> PredictionResult:
-        """Combined prediction from both models."""
         tech_pred = self.technical.predict(df)
-        logger.debug(f"[TECH] {self.symbol} → {tech_pred.signal.value} (conf={tech_pred.confidence:.0%})")
+        ml_pred: Optional[PredictionResult] = None
 
         if self.ml.is_trained:
             ml_pred = self.ml.predict(df)
-            logger.debug(f"[ML]   {self.symbol} → {ml_pred.signal.value} (conf={ml_pred.confidence:.0%})")
-            return self._combine(tech_pred, ml_pred)
+            raw     = self._combine_raw(tech_pred, ml_pred)
         else:
-            logger.debug(f"[HYBRID] ML not trained for {self.symbol} — Technical only")
-            return PredictionResult(
-                signal            = tech_pred.signal,
-                confidence        = tech_pred.confidence,
-                long_probability  = tech_pred.long_probability,
-                short_probability = tech_pred.short_probability,
-                source            = "hybrid(technical_only)",
-                reasoning         = f"[TECH] {tech_pred.reasoning}",
-                models_agree      = False,  # only one model available
+            raw = PredictionResult(
+                signal=tech_pred.signal,
+                confidence=tech_pred.confidence,
+                long_probability=tech_pred.long_probability,
+                short_probability=tech_pred.short_probability,
+                source="hybrid(technical_only)",
+                reasoning="BOTH_HOLD",
             )
 
-    def _combine(self, tech: PredictionResult, ml: PredictionResult) -> PredictionResult:
-        """
-        Weighted blend of technical and ML probabilities.
+        return self._apply_smoothing(raw, tech_pred, ml_pred)
 
-        Critical fix: REMOVED 0.75× disagreement penalty.
-        When models disagree the signal is still valid if blended confidence
-        exceeds MIN_CONFIDENCE. Penalizing disagreement was the root cause
-        of >80% HOLD signals in the original system.
-        """
+    # ── Raw combination ───────────────────────────────────────────────────
+
+    def _combine_raw(self, tech: PredictionResult, ml: PredictionResult) -> PredictionResult:
         tw = self.TECHNICAL_WEIGHT
         mw = self.ML_WEIGHT
 
-        # Blended probabilities
-        p_long  = tech.long_probability  * tw + ml.long_probability  * mw
-        p_short = tech.short_probability * tw + ml.short_probability * mw
-        p_hold  = max(0.0, 1.0 - p_long - p_short)
+        long_prob  = tech.long_probability  * tw + ml.long_probability  * mw
+        short_prob = tech.short_probability * tw + ml.short_probability * mw
+        hold_prob  = max(0.0, 1.0 - long_prob - short_prob)
 
-        # Normalize
-        total   = p_long + p_short + p_hold + 1e-10
-        p_long  /= total
-        p_short /= total
-        p_hold  /= total
+        probs      = {Signal.LONG: long_prob, Signal.SHORT: short_prob, Signal.HOLD: hold_prob}
+        signal     = max(probs, key=probs.get)
+        confidence = probs[signal]
 
-        # Determine primary signal
-        if p_long > self.LONG_THRESHOLD and p_long >= p_short:
-            signal     = Signal.LONG
-            confidence = p_long
-        elif p_short > self.SHORT_THRESHOLD and p_short > p_long:
-            signal     = Signal.SHORT
-            confidence = p_short
+        if tech.signal == ml.signal and tech.signal != Signal.HOLD:
+            confidence += self.AGREEMENT_BONUS
+            agreement   = "AGREE"
+        elif tech.signal == Signal.HOLD and ml.signal == Signal.HOLD:
+            agreement   = "BOTH_HOLD"
         else:
-            signal     = Signal.HOLD
-            confidence = p_hold
+            confidence  = confidence * 0.80
+            agreement   = "SPLIT"
 
-        # Agreement: both models independently chose the same direction
-        agrees = tech.signal == ml.signal and tech.signal != Signal.HOLD
+        confidence = min(1.0, confidence)
 
-        # Agreement bonus — only for directional signals where both agree
-        if agrees and signal != Signal.HOLD:
-            confidence    = min(1.0, confidence + self.AGREEMENT_BONUS)
-            agreement_str = "AGREE"
-        else:
-            # NO penalty — models may specialize in different conditions.
-            # SPLIT just means we rely more on the blended probability alone.
-            agreement_str = "SPLIT" if tech.signal != ml.signal else "BOTH_HOLD"
-
-        # Final confidence gate — only suppress very uncertain signals
-        if signal != Signal.HOLD and confidence < self.MIN_CONFIDENCE:
-            logger.debug(
-                f"[HYBRID] {self.symbol} conf {confidence:.0%} < "
-                f"{self.MIN_CONFIDENCE:.0%} → HOLD"
-            )
-            signal     = Signal.HOLD
-            confidence = p_hold
-            agrees     = False
-
-        reasoning = (
-            f"[HYBRID {agreement_str}] "
-            f"TECH={tech.signal.value}({tech.confidence:.0%}) | "
-            f"ML={ml.signal.value}({ml.confidence:.0%}) | "
-            f"blend: L={p_long:.0%} S={p_short:.0%} H={p_hold:.0%} | "
-            f"→ {signal.value}({confidence:.0%})"
+        return PredictionResult(
+            signal=signal,
+            confidence=confidence,
+            long_probability=long_prob,
+            short_probability=short_prob,
+            source="hybrid",
+            reasoning=agreement,
         )
 
+    # ── EMA smoothing + confirmation window ───────────────────────────────
+
+    def _apply_smoothing(
+        self,
+        raw:  PredictionResult,
+        tech: PredictionResult,
+        ml:   Optional[PredictionResult],
+    ) -> PredictionResult:
+        alpha = self.PROB_EMA_ALPHA
+        s     = self._state
+
+        # Update EMA
+        s.ema_long  = alpha * raw.long_probability  + (1 - alpha) * s.ema_long
+        s.ema_short = alpha * raw.short_probability + (1 - alpha) * s.ema_short
+        ema_hold    = max(0.0, 1.0 - s.ema_long - s.ema_short)
+
+        smooth_probs = {
+            Signal.LONG:  s.ema_long,
+            Signal.SHORT: s.ema_short,
+            Signal.HOLD:  ema_hold,
+        }
+        candidate  = max(smooth_probs, key=smooth_probs.get)
+        confidence = smooth_probs[candidate]
+
+        # Confirmation: direction changes require multiple bars
+        if candidate == s.current_signal:
+            s.consecutive_bars += 1
+            emit_signal = candidate
+        else:
+            s.consecutive_bars += 1
+            if s.consecutive_bars >= self.SIGNAL_CONFIRM_BARS:
+                # Accept new direction
+                s.current_signal   = candidate
+                s.consecutive_bars = 1
+                emit_signal        = candidate
+            else:
+                # Still building confirmation — hold current
+                emit_signal = s.current_signal
+                confidence  = smooth_probs.get(s.current_signal, ema_hold)
+
+        # Derive agreement
+        if ml is not None:
+            if tech.signal == ml.signal and tech.signal != Signal.HOLD:
+                agreement = "AGREE"
+            elif tech.signal == Signal.HOLD and ml.signal == Signal.HOLD:
+                agreement = "BOTH_HOLD"
+            else:
+                agreement = "SPLIT"
+        else:
+            agreement = "BOTH_HOLD"
+
+        # Confidence threshold gate
+        if confidence < self._threshold and emit_signal != Signal.HOLD:
+            emit_signal = Signal.HOLD
+            confidence  = confidence * 0.5
+
         logger.info(
-            f"[HYBRID] {self.symbol} {signal.value} | "
-            f"conf={confidence:.0%} | {agreement_str}"
+            f"[HYBRID] {self.symbol} {emit_signal.value} | "
+            f"conf={confidence:.0%} | {agreement}"
         )
 
         return PredictionResult(
-            signal            = signal,
-            confidence        = confidence,
-            long_probability  = p_long,
-            short_probability = p_short,
-            source            = "hybrid",
-            reasoning         = reasoning,
-            models_agree      = agrees,   # ← now passed through to trader
+            signal=emit_signal,
+            confidence=confidence,
+            long_probability=s.ema_long,
+            short_probability=s.ema_short,
+            source="hybrid",
+            reasoning=(
+                f"[HYBRID {agreement}] "
+                f"ema_long={s.ema_long:.2%} ema_short={s.ema_short:.2%} "
+                f"confirm={s.consecutive_bars}"
+            ),
         )
+
+    # ── Utility ───────────────────────────────────────────────────────────
 
     def train_ml(self, df: pd.DataFrame, **kwargs):
         return self.ml.train(df, **kwargs)

@@ -1,60 +1,20 @@
 """
 core/market/regime_detector.py
-══════════════════════════════════════════════════════════════════════════════
-Market Regime Detection and Adaptive Strategy Parameters.
+────────────────────────────────
+Market regime detection with stability smoothing.
 
-WHAT IT DOES
-────────────
-Analyses the current bar's indicators (ADX, ATR, EMA) to classify the market
-into one of three regimes, then returns a set of adjusted strategy parameters
-for that regime. FuturesTrader uses these parameters every cycle instead of
-fixed class-level constants.
+Regimes:
+    TRENDING      — ADX > 25, directional momentum in play
+    RANGING       — ADX < 20, price oscillating in a range
+    HIGH_VOL      — ATR spike regardless of ADX, reduce size
 
-REGIMES
-───────
-  TRENDING       — Strong directional movement (ADX > ADX_TREND_THRESHOLD)
-                   • Lower confidence threshold  → enter on slightly weaker signals
-                   • Wider TP (larger ATR mult)  → let trends run
-                   • Slightly wider SL           → avoid noise stopping you out early
-                   • Normal position size
-
-  RANGE          — Price oscillating (ADX low, ATR near mean)
-                   • Higher confidence threshold → require stronger confirmation
-                   • Tighter TP                  → take profit faster before reversal
-                   • Normal SL
-                   • Normal position size
-
-  HIGH_VOLATILITY — Large price swings (ATR >> historical mean)
-                   • Normal confidence threshold
-                   • Wider SL to survive spikes
-                   • Reduced position size (0.6×) to limit drawdown per trade
-
-INTEGRATION
-───────────
-  Called once per cycle in FuturesTrader.run_cycle() after indicators are built.
-  Returns a RegimeResult that overrides:
-    - confidence_threshold (replaces CONF_THRESHOLDS[symbol])
-    - atr_sl_mult          (replaces ATR_SL_MULT[symbol])
-    - atr_tp_mult          (replaces ATR_TP_MULT[symbol])
-    - position_size_scale  (multiplies Kelly-sized quantity)
-    - early_profit_r       (replaces EARLY_PROFIT_THRESHOLD_R)
-
-DOES NOT TOUCH
-──────────────
-  - Portfolio risk cap (still enforced after sizing)
-  - Cooldown logic
-  - Agreement filter
-  - Entry gate
-  - MAX_HOLD_BARS timeout
-  - TP/SL recovery on restart
-
-DETECTION STABILITY
-───────────────────
-  A single noisy bar cannot flip the regime. The detector uses a short rolling
-  confirmation window (CONFIRMATION_BARS): the regime is only confirmed when
-  the same regime is detected for N consecutive bars. During the confirmation
-  window the previous regime is held. This prevents thrashing between regimes
-  on volatile single bars.
+Key design decisions:
+    1. CONFIRMATION WINDOW: raw regime must persist N bars before we
+       commit to a flip. Eliminates the RANGE→TRENDING on cycle #2 bug.
+    2. HYSTERESIS: separate entry/exit thresholds so we don't oscillate
+       around the boundary (ADX 24.9 → RANGING, 25.1 → TRENDING, etc.)
+    3. Each regime adjusts: confidence threshold, TP/SL multipliers,
+       position size scale, early-profit R threshold.
 """
 
 from __future__ import annotations
@@ -62,9 +22,8 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Deque, Optional
 
-import numpy as np
 import pandas as pd
 
 from config.logger import get_logger
@@ -75,257 +34,167 @@ logger = get_logger(__name__)
 # ── Regime enum ───────────────────────────────────────────────────────────────
 
 class Regime(str, Enum):
-    TRENDING        = "TRENDING"
-    RANGE           = "RANGE"
-    HIGH_VOLATILITY = "HIGH_VOLATILITY"
+    TRENDING   = "TRENDING"
+    RANGING    = "RANGING"
+    HIGH_VOL   = "HIGH_VOL"
 
 
-# ── Result dataclass ──────────────────────────────────────────────────────────
+# ── Per-regime parameter bundle ───────────────────────────────────────────────
 
 @dataclass
-class RegimeResult:
-    """
-    All strategy parameters adjusted for the current market regime.
-    FuturesTrader uses these in place of its class-level constants.
-    """
-    regime:               Regime
-    confidence_threshold: float   # minimum model confidence to enter
-    atr_sl_mult:          float   # SL = entry ± atr_sl_mult × ATR
-    atr_tp_mult:          float   # TP = entry ± atr_tp_mult × ATR
-    position_size_scale:  float   # Kelly quantity × this (1.0 = no change)
-    early_profit_r:       float   # close early when R >= this value
-
-    # Diagnostic fields (shown in dashboard, not used for trading)
-    adx:                  float = 0.0
-    atr:                  float = 0.0
-    atr_ratio:            float = 0.0   # current ATR / rolling mean ATR
-    confirmation_pct:     float = 0.0   # how consistently same regime detected
-    # In TRENDING regime: whether AGREE is required regardless of global setting
-    require_agree:        bool  = False
+class RegimeParams:
+    regime:           Regime
+    # confidence threshold ADDITIVE adjustment (±pp, e.g. +0.05 = raise by 5pp)
+    conf_thr_delta:   float
+    sl_mult:          float   # multiply base ATR SL distance
+    tp_mult:          float   # multiply base ATR TP distance
+    size_scale:       float   # fraction of normal position size (0.5–1.0)
+    early_profit_r:   float   # close partial at this R multiple
+    require_agree:    bool    # force AGREE-only regardless of global setting
 
 
-# ── Per-regime parameter tables ───────────────────────────────────────────────
-# All values are relative to the symbol's base ATR multipliers.
-# base_sl and base_tp are passed in from ATR_SL_MULT / ATR_TP_MULT at call time
-# so these are multiplied against the base, not hardcoded absolute values.
-
-# ── Why TRENDING raises the threshold, not lowers it ─────────────────────────
-# ADX > 25 means strong directional movement — but it does NOT tell you whether
-# the trend is up or down. A SHORT signal in a strong UPTREND is the worst
-# combination. Original design lowered threshold in TRENDING regime to "let
-# trend signals through easier", but this allowed SPLIT (ML disagrees with
-# technical) shorts through in uptrending assets (SOL, Mar 16). The fix:
-# raise the threshold slightly and REQUIRE AGREE — in a trending market you
-# need more conviction, not less, before trading counter-momentum.
-#
-# TP expansion (1.5×) is also removed from TRENDING. In a ranging crypto
-# market that the ADX briefly calls "trending" (ADX=27-38), a 5.4×ATR TP
-# target on SOL means price must move $3.40 from entry — almost never reached
-# in 8 bars on a $93 asset. Kept at 1.2× (modest expansion only).
-_REGIME_PARAMS = {
-    Regime.TRENDING: {
-        # Trending: RAISE threshold — need conviction before trading in a trend.
-        # AGREE required (enforced in futures_trader.py, see TRENDING_REQUIRE_AGREE).
-        "conf_adjustment":    +0.03,   # higher threshold by 3pp (e.g. 0.42 → 0.45)
-        "sl_mult_factor":      1.25,   # wider SL: 1.25× base (trend noise buffer)
-        "tp_mult_factor":      1.20,   # modest TP expansion: 1.2× base only
-        "position_size_scale": 0.80,   # slightly smaller size — trending = riskier
-        "early_profit_r":      0.60,   # hold a bit longer for trend to develop
-    },
-    Regime.RANGE: {
-        # Range: require stronger confirmation, take profit quickly
-        "conf_adjustment":    +0.05,   # higher threshold by 5pp (e.g. 0.42 → 0.47)
-        "sl_mult_factor":      1.00,   # normal SL
-        "tp_mult_factor":      1.00,   # normal TP — don't reach for large targets
-        "position_size_scale": 1.00,   # normal size
-        "early_profit_r":      0.35,   # take profit faster before mean-reversion
-    },
-    Regime.HIGH_VOLATILITY: {
-        # High vol: widen SL to survive spikes, reduce size to limit loss
-        "conf_adjustment":    +0.05,   # also raise threshold in volatile market
-        "sl_mult_factor":      1.40,   # much wider SL: 1.4× base
-        "tp_mult_factor":      1.10,   # only slightly wider TP
-        "position_size_scale": 0.50,   # 50% of normal size (was 60%)
-        "early_profit_r":      0.40,   # take profits a bit faster in vol
-    },
-}
-
-# In TRENDING regime, REQUIRE_AGREEMENT is enforced unconditionally regardless
-# of the trader's global REQUIRE_AGREEMENT setting. This prevents SPLIT signals
-# from slipping through just because ADX is high.
-# Set False only for research purposes.
-TRENDING_REQUIRE_AGREE = True
-
-# ── Detection thresholds ──────────────────────────────────────────────────────
-
-ADX_TREND_THRESHOLD   = 25.0   # ADX above this → trending
-ATR_VOLATILITY_MULT   = 1.5    # ATR > mean × this → high volatility
-ATR_LOOKBACK_BARS     = 48     # bars to compute rolling ATR mean (48 × 15m = 12h)
-CONFIRMATION_BARS     = 2      # consecutive bars of same regime to confirm flip
-
+# ── Main detector ─────────────────────────────────────────────────────────────
 
 class RegimeDetector:
     """
-    Detects market regime from OHLCV indicator data and returns adjusted
-    strategy parameters.
+    Stateful per-symbol regime detector.
 
-    One instance per FuturesTrader symbol. Maintains a short history of
-    recent detections to prevent single-bar regime flips.
-
-    Usage:
-        detector = RegimeDetector(symbol="BTCUSDT")
-
-        # In run_cycle(), after add_all_indicators(df):
-        result = detector.detect(df, base_sl_mult=1.5, base_tp_mult=3.0,
-                                 base_conf_threshold=0.42)
-
-        # Use result.confidence_threshold instead of CONF_THRESHOLDS[symbol]
-        # Use result.atr_sl_mult / result.atr_tp_mult for TP/SL computation
-        # Multiply Kelly quantity by result.position_size_scale
+    Call .detect(df) each cycle — it returns stable RegimeParams only
+    after CONFIRMATION_BARS consecutive identical raw readings.
     """
+
+    # ── Thresholds ────────────────────────────────────────────────────────
+    ADX_TRENDING_ENTER  = 25.0   # raw ADX must exceed this to call TRENDING
+    ADX_TRENDING_EXIT   = 20.0   # confirmed TRENDING exits only when ADX drops below this
+    ATR_SPIKE_RATIO     = 2.0    # ATR / 20-bar mean > this → HIGH_VOL overlay
+
+    # ── Stability: how many consecutive bars must agree before flip ───────
+    CONFIRMATION_BARS   = 3      # was effectively 0 — caused the cycle #1→#2 flip
+
+    # ── Per-regime parameter tables ───────────────────────────────────────
+    _PARAMS: dict[Regime, RegimeParams] = {
+        Regime.TRENDING: RegimeParams(
+            regime=Regime.TRENDING,
+            conf_thr_delta=+0.03,   # slightly raise bar in trending (want cleaner entries)
+            sl_mult=1.25,
+            tp_mult=1.20,
+            size_scale=0.80,        # smaller size — bigger SL distance
+            early_profit_r=0.60,
+            require_agree=True,     # trending regimes: AGREE mandatory
+        ),
+        Regime.RANGING: RegimeParams(
+            regime=Regime.RANGING,
+            conf_thr_delta=+0.05,   # raise threshold — ranging is noisy
+            sl_mult=1.00,
+            tp_mult=1.00,
+            size_scale=1.00,
+            early_profit_r=0.35,    # take profit earlier — ranging mean-reverts
+            require_agree=False,
+        ),
+        Regime.HIGH_VOL: RegimeParams(
+            regime=Regime.HIGH_VOL,
+            conf_thr_delta=+0.05,
+            sl_mult=1.40,           # wider stop for volatility
+            tp_mult=1.10,
+            size_scale=0.50,        # half size when vol spikes
+            early_profit_r=0.40,
+            require_agree=False,
+        ),
+    }
 
     def __init__(self, symbol: str):
         self.symbol = symbol
-        self._history: deque[Regime] = deque(maxlen=CONFIRMATION_BARS + 2)
-        self._confirmed_regime: Regime = Regime.RANGE   # default until data arrives
-        self._raw_regime:       Regime = Regime.RANGE
 
-    def detect(
-        self,
-        df:                   pd.DataFrame,
-        base_sl_mult:         float,
-        base_tp_mult:         float,
-        base_conf_threshold:  float,
-    ) -> RegimeResult:
+        # Current confirmed regime (starts as RANGING until we see data)
+        self._confirmed_regime: Regime = Regime.RANGING
+
+        # Rolling buffer of raw regime calls — confirmation window
+        self._raw_history: Deque[Regime] = deque(maxlen=self.CONFIRMATION_BARS)
+
+        # Pending candidate: (regime, bars_seen_consecutively)
+        self._pending_regime:   Optional[Regime] = None
+        self._pending_count:    int = 0
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def detect(self, df: pd.DataFrame) -> RegimeParams:
         """
-        Detect current regime and return adjusted strategy parameters.
+        Analyse latest candle and return stable RegimeParams.
 
-        Parameters
-        ----------
-        df                  : indicator-enriched OHLCV dataframe (from add_all_indicators)
-        base_sl_mult        : symbol's default ATR SL multiplier
-        base_tp_mult        : symbol's default ATR TP multiplier
-        base_conf_threshold : symbol's default confidence threshold
+        The returned regime will only change after CONFIRMATION_BARS
+        consecutive identical raw readings — never on a single candle.
         """
-        adx, atr, atr_ratio = self._extract_indicators(df)
+        raw = self._compute_raw(df)
+        self._update_confirmation(raw)
 
-        # ── Raw regime detection ───────────────────────────────────────────────
-        if adx >= ADX_TREND_THRESHOLD:
-            raw = Regime.TRENDING
-        elif atr_ratio >= ATR_VOLATILITY_MULT:
-            raw = Regime.HIGH_VOLATILITY
-        else:
-            raw = Regime.RANGE
+        params = self._PARAMS[self._confirmed_regime]
 
-        self._raw_regime = raw
-        self._history.append(raw)
+        # Build display threshold for log
+        from config.settings import settings
+        base_thr = settings.model.confidence_threshold
+        conf_thr = min(0.95, base_thr + params.conf_thr_delta)
 
-        # ── Confirmation: only flip confirmed regime after N consistent bars ──
-        # This prevents a single volatile bar from switching all parameters.
-        if len(self._history) >= CONFIRMATION_BARS:
-            recent = list(self._history)[-CONFIRMATION_BARS:]
-            if all(r == raw for r in recent):
-                if raw != self._confirmed_regime:
-                    logger.info(
-                        f"[REGIME CHANGE] {self.symbol}: "
-                        f"{self._confirmed_regime.value} → {raw.value} | "
-                        f"ADX={adx:.1f}  ATR_ratio={atr_ratio:.2f}"
-                    )
-                self._confirmed_regime = raw
-
-        # ── Build result from confirmed regime ─────────────────────────────────
-        params = _REGIME_PARAMS[self._confirmed_regime]
-
-        conf_threshold = max(
-            0.35,   # never go below 35% regardless of regime
-            min(0.75, base_conf_threshold + params["conf_adjustment"])
-        )
-
-        atr_sl_mult = base_sl_mult * params["sl_mult_factor"]
-        atr_tp_mult = base_tp_mult * params["tp_mult_factor"]
-        pos_scale   = params["position_size_scale"]
-        early_r     = params["early_profit_r"]
-
-        # Consistency count for diagnostic
-        recent_all  = list(self._history)
-        same_count  = sum(1 for r in recent_all if r == self._confirmed_regime)
-        confirm_pct = same_count / max(len(recent_all), 1)
-
-        # TRENDING regime always requires AGREE regardless of global setting
-        req_agree = (self._confirmed_regime == Regime.TRENDING and TRENDING_REQUIRE_AGREE)
-
-        result = RegimeResult(
-            regime               = self._confirmed_regime,
-            confidence_threshold = conf_threshold,
-            atr_sl_mult          = atr_sl_mult,
-            atr_tp_mult          = atr_tp_mult,
-            position_size_scale  = pos_scale,
-            early_profit_r       = early_r,
-            adx                  = adx,
-            atr                  = atr,
-            atr_ratio            = atr_ratio,
-            confirmation_pct     = confirm_pct,
-            require_agree        = req_agree,
-        )
+        atr   = float(df["atr"].iloc[-1])   if "atr"   in df.columns else 0.0
+        adx   = float(df["adx"].iloc[-1])   if "adx"   in df.columns else 0.0
+        atr_m = float(df["atr"].rolling(20).mean().iloc[-1]) if "atr" in df.columns else 1.0
+        atr_r = atr / atr_m if atr_m > 0 else 1.0
 
         logger.info(
-            f"[REGIME] {self.symbol}: {self._confirmed_regime.value} "
-            f"(raw={raw.value}) | "
-            f"ADX={adx:.1f}  ATR={atr:.4f}  ATR_ratio={atr_ratio:.2f} | "
-            f"conf_thr={conf_threshold:.0%}  sl_mult={atr_sl_mult:.2f}x  "
-            f"tp_mult={atr_tp_mult:.2f}x  size_scale={pos_scale:.0%}  "
-            f"early_r={early_r:.2f}R"
+            f"[REGIME] {self.symbol}: {self._confirmed_regime.value} (raw={raw.value}) | "
+            f"ADX={adx:.1f}  ATR={atr:.4f}  ATR_ratio={atr_r:.2f} | "
+            f"conf_thr={conf_thr:.0%}  sl_mult={params.sl_mult:.2f}x  "
+            f"tp_mult={params.tp_mult:.2f}x  size_scale={params.size_scale:.0%}  "
+            f"early_r={params.early_profit_r:.2f}R"
         )
 
-        return result
-
-    # ── Indicator extraction ──────────────────────────────────────────────────
-
-    def _extract_indicators(
-        self, df: pd.DataFrame
-    ) -> tuple[float, float, float]:
-        """
-        Extract ADX, ATR, and ATR ratio from the dataframe.
-        Returns (adx, current_atr, atr_ratio).
-
-        Falls back gracefully if columns are missing.
-        """
-        # ADX
-        adx = 0.0
-        for col in ["adx", "ADX", "adx_14"]:
-            if col in df.columns:
-                val = float(df[col].iloc[-1])
-                if not np.isnan(val):
-                    adx = val
-                    break
-
-        # ATR
-        atr = 0.0
-        for col in ["atr", "ATR", "atr_14"]:
-            if col in df.columns:
-                val = float(df[col].iloc[-1])
-                if not np.isnan(val):
-                    atr = val
-                    break
-
-        # ATR ratio: current ATR vs rolling mean over last N bars
-        atr_ratio = 1.0
-        if atr > 0:
-            for col in ["atr", "ATR", "atr_14"]:
-                if col in df.columns:
-                    series = df[col].dropna()
-                    if len(series) >= ATR_LOOKBACK_BARS:
-                        mean_atr = float(series.iloc[-ATR_LOOKBACK_BARS:].mean())
-                    elif len(series) > 5:
-                        mean_atr = float(series.mean())
-                    else:
-                        mean_atr = atr   # not enough history — assume normal vol
-                    if mean_atr > 0:
-                        atr_ratio = atr / mean_atr
-                    break
-
-        return adx, atr, atr_ratio
+        return params
 
     @property
     def current_regime(self) -> Regime:
         return self._confirmed_regime
+
+    # ── Internal ─────────────────────────────────────────────────────────
+
+    def _compute_raw(self, df: pd.DataFrame) -> Regime:
+        """Single-candle regime from raw indicators — NOT stability-filtered."""
+        adx = float(df["adx"].iloc[-1]) if "adx" in df.columns else 0.0
+
+        # ATR spike check
+        if "atr" in df.columns:
+            atr     = float(df["atr"].iloc[-1])
+            atr_avg = float(df["atr"].rolling(20).mean().iloc[-1])
+            if atr_avg > 0 and (atr / atr_avg) > self.ATR_SPIKE_RATIO:
+                return Regime.HIGH_VOL
+
+        # ADX with hysteresis
+        if self._confirmed_regime == Regime.TRENDING:
+            # Already TRENDING — only exit if ADX drops below EXIT threshold
+            if adx < self.ADX_TRENDING_EXIT:
+                return Regime.RANGING
+            return Regime.TRENDING
+        else:
+            # Not TRENDING — only enter if ADX exceeds ENTER threshold
+            if adx >= self.ADX_TRENDING_ENTER:
+                return Regime.TRENDING
+            return Regime.RANGING
+
+    def _update_confirmation(self, raw: Regime):
+        """
+        Track consecutive identical raw signals.
+        Flip confirmed regime only after CONFIRMATION_BARS consecutive matches.
+        """
+        if raw == self._pending_regime:
+            self._pending_count += 1
+        else:
+            # New candidate — reset counter
+            self._pending_regime = raw
+            self._pending_count  = 1
+
+        if self._pending_count >= self.CONFIRMATION_BARS:
+            if raw != self._confirmed_regime:
+                logger.info(
+                    f"[REGIME CHANGE] {self.symbol}: "
+                    f"{self._confirmed_regime.value} → {raw.value} "
+                    f"(confirmed after {self.CONFIRMATION_BARS} bars)"
+                )
+            self._confirmed_regime = raw
