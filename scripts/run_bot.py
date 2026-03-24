@@ -1,10 +1,13 @@
 """
 scripts/run_bot.py — Main entry point.
 
+v6: Faster cycle interval (5s default) with smart signal gating.
+    Position monitoring every cycle. Signal eval every 60s or on new 1m candle.
+
 Usage:
     python scripts/run_bot.py
     python scripts/run_bot.py --pairs BTCUSDT ETHUSDT --leverage 10
-    python scripts/run_bot.py --interval 60
+    python scripts/run_bot.py --interval 5
     python scripts/run_bot.py --risk 0.5
     python scripts/run_bot.py --train
 """
@@ -35,6 +38,9 @@ console = Console()
 
 _traders: List[FuturesTrader] = []
 _running = True
+
+# Dashboard refresh: print every N cycles to avoid console spam at 5s cycles
+DASHBOARD_EVERY_N = 6   # every ~30s at 5s cycle
 
 
 def signal_handler(sig, frame):
@@ -77,16 +83,13 @@ async def print_dashboard(exchange, traders: List[FuturesTrader]):
             pos    = pos_map.get(_normalize_symbol(t.symbol))
             regime = stats.get("regime", "?")
 
-            # Win rate from recalibrator (most active direction)
-            recalib = stats.get("recalib", {})
+            recalib  = stats.get("recalib", {})
             long_wr  = recalib.get("long",  {}).get("win_rate", 0.5)
             short_wr = recalib.get("short", {}).get("win_rate", 0.5)
             long_n   = recalib.get("long",  {}).get("trades", 0)
             short_n  = recalib.get("short", {}).get("trades", 0)
-            if long_n + short_n > 0:
-                wr_str = f"L{long_wr:.0%}/{long_n} S{short_wr:.0%}/{short_n}"
-            else:
-                wr_str = "—"
+            wr_str   = f"L{long_wr:.0%}/{long_n} S{short_wr:.0%}/{short_n}" \
+                       if long_n + short_n > 0 else "—"
 
             if pos:
                 side_str  = "[green]LONG[/]"  if pos.side.value == "long" else "[red]SHORT[/]"
@@ -145,7 +148,7 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct, interval):
     console.print(f"  Pairs       : {', '.join(pairs)}")
     console.print(f"  Leverage    : {leverage}x  |  Risk/trade: {risk_pct}%")
     console.print(f"  Timeframe   : 5m candles  |  Cycle: {interval}s")
-    console.print(f"  Candle gate : Active (signal only on new 5m candle)\n")
+    console.print(f"  Signal gate : 1m candle OR 60s elapsed (whichever first)\n")
 
     exchange  = create_exchange("binance")
     connected = await exchange.connect()
@@ -161,9 +164,9 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct, interval):
         max_open_trades=settings.risk.max_open_trades,
         max_daily_loss_pct=settings.risk.max_daily_loss_pct,
     )
-    risk_manager  = RiskManager(risk_settings)
-    recovery      = RecoveryStrategy()
-    recalibrator  = SignalRecalibrator(log_dir=settings.logs_dir)
+    risk_manager = RiskManager(risk_settings)
+    recovery     = RecoveryStrategy()
+    recalibrator = SignalRecalibrator(log_dir=settings.logs_dir)
 
     balance = await exchange.get_balance()
     risk_manager.set_session_balance(balance.total_balance)
@@ -187,20 +190,21 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct, interval):
 
     console.print("[bold green]Bot running — Ctrl+C to stop[/]\n")
 
+    cycle_count = 0
     while _running:
         try:
             risk_manager.tick()
+            cycle_count += 1
 
             await asyncio.gather(
                 *[t.run_cycle() for t in _traders],
                 return_exceptions=True
             )
-            await print_dashboard(exchange, _traders)
 
-            for _ in range(interval):
-                if not _running:
-                    break
-                await asyncio.sleep(1)
+            if cycle_count % DASHBOARD_EVERY_N == 0:
+                await print_dashboard(exchange, _traders)
+
+            await asyncio.sleep(interval)
 
         except Exception as e:
             logger.error(f"Main loop error: {e}", exc_info=True)
@@ -219,7 +223,7 @@ def parse_args():
     parser.add_argument("--tp",       type=float, default=settings.risk.take_profit_pct)
     parser.add_argument("--sl",       type=float, default=settings.risk.stop_loss_pct)
     parser.add_argument("--risk",     type=float, default=settings.risk.risk_per_trade_pct)
-    parser.add_argument("--interval", type=int,   default=60)   # 60s cycle, 5m candle
+    parser.add_argument("--interval", type=int,   default=5)   # 5s cycles, signal gate handles noise
     return parser.parse_args()
 
 

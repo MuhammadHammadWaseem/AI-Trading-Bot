@@ -161,32 +161,58 @@ class BinanceExchange(BaseExchange):
                 message=str(e)
             )
 
-    async def close_position(self, symbol, order_id=None) -> OrderResult:
-        try:
-            # Normalize incoming symbol to match what get_open_positions() stores
-            norm_sym = symbol.replace("/", "").replace(":USDT", "").replace(":BTC", "").upper()
 
+    async def close_position_partial(self, symbol: str, quantity: float) -> "OrderResult":
+        """Close a partial quantity of an open position (reduceOnly)."""
+        try:
             positions = await self.get_open_positions()
-            pos = next((p for p in positions if p.symbol == norm_sym), None)
+            pos = next((p for p in positions if p.symbol == symbol), None)
             if not pos:
                 return OrderResult(
-                    success=False, order_id="", symbol=norm_sym,
+                    success=False, order_id="", symbol=symbol,
                     side=OrderSide.LONG, quantity=0, price=0,
-                    status=OrderStatus.CLOSED, message="No open position"
+                    status=OrderStatus.CANCELLED, message="No open position"
                 )
-
             close_side = "sell" if pos.side == OrderSide.LONG else "buy"
+            qty = min(quantity, pos.quantity)
             order = await self._exchange.create_market_order(
-                norm_sym, close_side, pos.quantity,
+                symbol, close_side, qty,
                 params={"reduceOnly": True, "positionSide": "BOTH"}
             )
             price = float(order.get("price") or order.get("average") or 0)
-            logger.info(
-                f"[CLOSE] {norm_sym} qty={pos.quantity} "
-                f"PnL={pos.unrealized_pnl:+.4f} USDT"
-            )
+            logger.info(f"[PARTIAL CLOSE] {symbol} qty={qty} price={price:.4f}")
             return OrderResult(
-                success=True, order_id=str(order["id"]), symbol=norm_sym,
+                success=True, order_id=str(order["id"]), symbol=symbol,
+                side=pos.side, quantity=qty, price=price,
+                status=OrderStatus.CLOSED,
+            )
+        except Exception as e:
+            logger.error(f"close_position_partial {symbol}: {e}")
+            return OrderResult(
+                success=False, order_id="", symbol=symbol,
+                side=OrderSide.LONG, quantity=0, price=0,
+                status=OrderStatus.CANCELLED, message=str(e)
+            )
+
+    async def close_position(self, symbol, order_id=None) -> OrderResult:
+        try:
+            positions = await self.get_open_positions()
+            pos = next((p for p in positions if p.symbol == symbol), None)
+            if not pos:
+                return OrderResult(
+                    success=False, order_id="", symbol=symbol,
+                    side=OrderSide.LONG, quantity=0, price=0,
+                    status=OrderStatus.CLOSED, message="No open position"
+                )
+            close_side = "sell" if pos.side == OrderSide.LONG else "buy"
+            order = await self._exchange.create_market_order(
+                symbol, close_side, pos.quantity,
+                params={"reduceOnly": True, "positionSide": "BOTH"}
+            )
+            price = float(order.get("price") or order.get("average") or 0)
+            logger.info(f"[CLOSE] {symbol} PnL={pos.unrealized_pnl:+.4f} USDT")
+            return OrderResult(
+                success=True, order_id=str(order["id"]), symbol=symbol,
                 side=pos.side, quantity=pos.quantity, price=price,
                 status=OrderStatus.CLOSED,
             )
@@ -206,12 +232,8 @@ class BinanceExchange(BaseExchange):
                 if float(p.get("contracts", 0)) == 0:
                     continue
                 side = OrderSide.LONG if p["side"] == "long" else OrderSide.SHORT
-                # Normalize symbol from ccxt format (e.g. "BTC/USDT:USDT") to
-                # plain format (e.g. "BTCUSDT") so close_position() can match it.
-                raw_sym  = p["symbol"]
-                norm_sym = raw_sym.replace("/", "").replace(":USDT", "").replace(":BTC", "").upper()
                 result.append(PositionInfo(
-                    symbol=norm_sym, side=side,
+                    symbol=p["symbol"], side=side,
                     entry_price=float(p.get("entryPrice", 0)),
                     current_price=float(p.get("markPrice", 0)),
                     quantity=float(p.get("contracts", 0)),

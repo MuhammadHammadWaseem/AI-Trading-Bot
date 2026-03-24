@@ -3,25 +3,37 @@ core/trader/futures_trader.py
 ──────────────────────────────
 Main trading orchestrator — one instance per symbol.
 
-Changes in this version (v4)
-------------------------------
-TIMEFRAME   : Changed from 15m to 5m — more responsive data, new candle
-              every 5 minutes instead of 15.
-CYCLE       : 60-second cycles. The bot checks every 60s whether a new
-              5m candle has closed and if the signal has changed.
-CANDLE GATE : Only re-evaluates signal when a NEW 5m candle has closed
-              (tracked by last_candle_ts). Prevents re-reading same partial
-              candle 5 times per cycle.
-VOLATILITY  : ATR_ratio gate still active — skips entry if ATR below average.
-PARTIAL TP  : Close 50% at 1.0R, move SL to breakeven on remainder.
-RECALIBRATOR: SignalRecalibrator tracks per-direction win rates and adjusts
-              confidence thresholds dynamically. No model retraining needed.
-              Trade outcomes feed into the recalibrator on every close.
+v6 Changes (filter calibration + execution frequency)
+───────────────────────────────────────────────────────
+CANDLE GATE   : Upgraded from "5m candle only" to hybrid timing.
+                - Position monitoring: every cycle (unchanged, 2–5s).
+                - Signal evaluation: every SIGNAL_EVAL_SECONDS (default 60s)
+                  OR on a new 1m candle close, whichever comes first.
+                - High-confidence AGREE signals (>= FAST_ENTRY_CONF) bypass
+                  the wait and enter on the current cycle.
+                This replaces the pure 5m candle gate that was blocking all
+                signals until a new 5m candle, creating 0–5 minute dead zones.
+
+ATR GATE      : Relaxed from 1.0 to 0.90. Values of 0.93–0.98 are valid
+                trading conditions (near-average volatility), not dead zones.
+
+AGREE FILTER  : Only enforced in TRENDING regime (correct behavior).
+                RANGING and HIGH_VOL regimes allow SPLIT signals.
+
+THRESHOLD     : Base 0.55 (was 0.65). Regime adds ±delta as before.
+                Combined effective range: 0.52 – 0.65 depending on regime.
+
+SPLIT TRADES  : Allowed when confidence >= SPLIT_MIN_CONF (0.52).
+                Only blocked in TRENDING regime with require_agree=True.
+
+RECALIBRATOR  : Still active — adjusts threshold based on live win rate.
+                Capped at ±0.08 to prevent over-suppression on cold start.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Optional
 
 from core.exchange.base_exchange import BaseExchange, OrderSide, PositionInfo
@@ -44,38 +56,51 @@ def _normalize_symbol(symbol: str) -> str:
 
 class FuturesTrader:
 
-    # Changed: 15m -> 5m for more responsive signals with 60s cycles
-    TIMEFRAME = "5m"
+    # ── Timeframes ────────────────────────────────────────────────────────
+    TIMEFRAME    = "5m"    # candles used for indicator computation
+    SIG_TIMEFRAME = "1m"  # candles used for fast signal timing gate
 
-    # ── Timeout by regime (in 5m bars) ────────────────────────────────────
-    # 5m bars: TRENDING=24 (2h), RANGING=12 (1h), HIGH_VOL=8 (40min)
+    # ── Execution timing ──────────────────────────────────────────────────
+    # Evaluate a new signal if EITHER:
+    #   (a) a new 1m candle has closed, OR
+    #   (b) SIGNAL_EVAL_SECONDS seconds have elapsed since last evaluation
+    # High-confidence AGREE signals also bypass the wait entirely.
+    SIGNAL_EVAL_SECONDS = 60    # max gap between signal evaluations
+    FAST_ENTRY_CONF     = 0.72  # AGREE signals above this bypass timing gate
+
+    # ── Position monitoring (every cycle) ─────────────────────────────────
+    # Timeout measured in 5m bars (same as before)
     TIMEOUT_BARS: dict[Regime, int] = {
-        Regime.TRENDING:  24,
-        Regime.RANGING:   12,
-        Regime.HIGH_VOL:   8,
+        Regime.TRENDING:  24,   # 2h
+        Regime.RANGING:   12,   # 1h
+        Regime.HIGH_VOL:   8,   # 40min
     }
+    COOLDOWN_BARS = 3           # 5m bars after close before next entry
 
-    # ── Cooldown after close (in 5m bars) ─────────────────────────────────
-    COOLDOWN_BARS = 3
-
-    # ── Trailing stop / partial TP ─────────────────────────────────────────
+    # ── Partial TP / trailing stop ────────────────────────────────────────
     BREAKEVEN_TRIGGER_R  = 1.0
     PARTIAL_TP_R         = 1.0
     PARTIAL_TP_FRACTION  = 0.5
-    MIN_HOLD_BARS        = 2    # lower for 5m (was 3 for 15m)
+    MIN_HOLD_BARS        = 2
 
-    # ── Volatility gate ────────────────────────────────────────────────────
-    ATR_RATIO_MIN = 1.0
+    # ── Volatility gate ───────────────────────────────────────────────────
+    # Relaxed from 1.0 to 0.90 — values 0.90–1.0 are near-average, still valid
+    ATR_RATIO_MIN = 0.90
+
+    # ── Confidence ────────────────────────────────────────────────────────
+    BASE_THRESHOLD    = 0.55    # was 0.65 — HybridModel now outputs 0.40–0.92
+    SPLIT_MIN_CONF    = 0.52    # minimum for SPLIT signal (no require_agree regime)
+    RECALIB_CAP       = 0.08    # max recalibrator adjustment (±pp)
 
     def __init__(self, exchange, symbol, risk_manager, recovery_strategy,
                  recalibrator: Optional[SignalRecalibrator] = None):
-        self.exchange      = exchange
-        self.symbol        = symbol
-        self.risk          = risk_manager
-        self.recovery      = recovery_strategy
-        self.model         = HybridModel(symbol=symbol)
-        self.regime        = RegimeDetector(symbol=symbol)
-        self.recalibrator  = recalibrator or SignalRecalibrator()
+        self.exchange     = exchange
+        self.symbol       = symbol
+        self.risk         = risk_manager
+        self.recovery     = recovery_strategy
+        self.model        = HybridModel(symbol=symbol)
+        self.regime       = RegimeDetector(symbol=symbol)
+        self.recalibrator = recalibrator or SignalRecalibrator()
 
         self._is_active     = True
         self._cycles        = 0
@@ -83,23 +108,22 @@ class FuturesTrader:
 
         # Position state
         self._in_position        = False
-        self._tp_price:   Optional[float]        = None
-        self._sl_price:   Optional[float]        = None
+        self._tp_price:   Optional[float]       = None
+        self._sl_price:   Optional[float]       = None
         self._position_side: Optional[OrderSide] = None
-        self._entry_price: Optional[float]       = None
-        self._entry_confidence: float            = 0.0
+        self._entry_price: Optional[float]      = None
+        self._entry_confidence: float           = 0.0
         self._bars_held          = 0
         self._breakeven_moved    = False
         self._partial_exit_taken = False
 
-        # Cooldown after close
+        # Cooldown
         self._cooldown_bars_remaining = 0
 
-        # Candle gate: only re-evaluate when a new 5m candle has closed
-        # Stored as the timestamp (ms) of the last candle open we evaluated
-        self._last_candle_ts: Optional[int] = None
-
-        # Last regime for stats / recalibrator
+        # Signal timing
+        self._last_1m_candle_ts: Optional[int]  = None   # 1m candle gate
+        self._last_5m_candle_ts: Optional[int]  = None   # bar counting
+        self._last_eval_time:    float           = 0.0    # wall-clock gate
         self._last_regime_params: Optional[RegimeParams] = None
 
     # ── Helpers ───────────────────────────────────────────────────────────
@@ -111,6 +135,40 @@ class FuturesTrader:
                 return p
         return None
 
+    def _effective_threshold(self, regime_params: RegimeParams, side: OrderSide) -> float:
+        """
+        Compute effective confidence threshold:
+          base (0.55) + regime_delta + recalibrator_delta (capped)
+        """
+        recalib_adj = self.recalibrator.get_threshold_adjustment(
+            self.symbol, side.value) / 100.0
+        recalib_adj = max(-self.RECALIB_CAP, min(self.RECALIB_CAP, recalib_adj))
+        eff = self.BASE_THRESHOLD + regime_params.conf_thr_delta + recalib_adj
+        return min(0.85, max(0.45, eff))   # hard clamp [0.45, 0.85]
+
+    def _should_evaluate_signal(self, df_1m: Optional[pd.DataFrame], force: bool = False) -> bool:
+        """
+        Return True if it's time to run signal evaluation.
+        Conditions (any one suffices):
+          1. Forced (first cycle, after cooldown reset)
+          2. New 1m candle has closed
+          3. SIGNAL_EVAL_SECONDS have elapsed since last evaluation
+        """
+        if force:
+            return True
+
+        now = time.monotonic()
+        if now - self._last_eval_time >= self.SIGNAL_EVAL_SECONDS:
+            return True
+
+        if df_1m is not None and len(df_1m) > 0:
+            ts_1m = int(df_1m.index[-1].timestamp() * 1000) if hasattr(df_1m.index[-1], 'timestamp') else None
+            if ts_1m is not None and ts_1m != self._last_1m_candle_ts:
+                self._last_1m_candle_ts = ts_1m
+                return True
+
+        return False
+
     # ── Main cycle ────────────────────────────────────────────────────────
 
     async def run_cycle(self):
@@ -121,7 +179,7 @@ class FuturesTrader:
         logger.info(f"Cycle #{self._cycles} — {self.symbol}")
 
         try:
-            # ── Market data ───────────────────────────────────────────────
+            # ── Market data (5m for indicators + regime) ──────────────────
             candles = await self.exchange.get_ohlcv(self.symbol, self.TIMEFRAME, limit=200)
             if not candles or len(candles) < 50:
                 logger.warning(f"Insufficient candles for {self.symbol}")
@@ -131,9 +189,33 @@ class FuturesTrader:
             df            = add_all_indicators(df)
             current_price = float(df["close"].iloc[-1])
 
+            # ── 1h candles for HTF features (best-effort) ─────────────────
+            df_1h = None
+            try:
+                c1h = await self.exchange.get_ohlcv(self.symbol, "1h", limit=100)
+                if c1h and len(c1h) >= 20:
+                    df_1h = ohlcv_to_dataframe(c1h)
+            except Exception:
+                pass
+
+            # ── 1m candles for signal timing gate (best-effort) ───────────
+            df_1m = None
+            try:
+                c1m = await self.exchange.get_ohlcv(self.symbol, "1m", limit=5)
+                if c1m and len(c1m) >= 2:
+                    df_1m = ohlcv_to_dataframe(c1m)
+            except Exception:
+                pass
+
             # ── Regime detection ──────────────────────────────────────────
             regime_params = self.regime.detect(df)
             self._last_regime_params = regime_params
+
+            # ── Track 5m bars (for position hold/cooldown counting) ───────
+            ts_5m = int(df.index[-1].timestamp() * 1000) if hasattr(df.index[-1], 'timestamp') else self._cycles
+            new_5m_candle = (ts_5m != self._last_5m_candle_ts)
+            if new_5m_candle:
+                self._last_5m_candle_ts = ts_5m
 
             # ── Check existing position ───────────────────────────────────
             positions   = await self.exchange.get_open_positions()
@@ -141,54 +223,49 @@ class FuturesTrader:
 
             if current_pos:
                 self._in_position = True
-                # Count bars using candle closes, not wall-clock cycles
-                current_candle_ts = int(df.index[-1].timestamp() * 1000) if hasattr(df.index[-1], 'timestamp') else self._cycles
-                if self._last_candle_ts is None or current_candle_ts != self._last_candle_ts:
-                    self._bars_held      += 1
-                    self._last_candle_ts  = current_candle_ts
+                if new_5m_candle:
+                    self._bars_held += 1
                 await self._monitor_position(current_pos, current_price, df, regime_params)
                 return
 
-            # Position was closed externally
+            # Position closed externally
             if self._in_position:
                 logger.info(f"[CLOSED] {self.symbol} — ready for next trade")
                 self._reset_position_state()
 
             # ── Cooldown ──────────────────────────────────────────────────
             if self._cooldown_bars_remaining > 0:
-                # Only decrement on new candle
-                current_candle_ts = int(df.index[-1].timestamp() * 1000) if hasattr(df.index[-1], 'timestamp') else self._cycles
-                if self._last_candle_ts is None or current_candle_ts != self._last_candle_ts:
+                if new_5m_candle:
                     self._cooldown_bars_remaining -= 1
-                    self._last_candle_ts = current_candle_ts
                 logger.info(f"[COOLDOWN] {self.symbol} — {self._cooldown_bars_remaining} bars remaining")
                 return
 
-            # ── Candle gate ───────────────────────────────────────────────
-            # Only evaluate a new signal when a new 5m candle has closed.
-            # Between candle closes, the signal cannot meaningfully change.
-            current_candle_ts = int(df.index[-1].timestamp() * 1000) if hasattr(df.index[-1], 'timestamp') else None
-            if current_candle_ts is not None and current_candle_ts == self._last_candle_ts:
-                logger.info(f"[CANDLE GATE] {self.symbol} — no new 5m candle, skipping signal eval")
+            # ── Signal timing gate ────────────────────────────────────────
+            first_cycle = (self._last_eval_time == 0.0)
+            if not self._should_evaluate_signal(df_1m, force=first_cycle):
+                logger.info(f"[GATE] {self.symbol} — waiting for next eval window")
                 return
-            self._last_candle_ts = current_candle_ts
 
-            # ── Volatility gate ───────────────────────────────────────────
+            # ── Volatility gate (relaxed to 0.90) ─────────────────────────
             if "atr" in df.columns:
-                atr_series = df["atr"].dropna()
-                if len(atr_series) >= 20:
-                    atr_current = float(atr_series.iloc[-1])
-                    atr_mean    = float(atr_series.rolling(20).mean().iloc[-1])
-                    atr_ratio   = atr_current / atr_mean if atr_mean > 0 else 1.0
+                atr_s = df["atr"].dropna()
+                if len(atr_s) >= 20:
+                    atr_cur  = float(atr_s.iloc[-1])
+                    atr_mean = float(atr_s.rolling(20).mean().iloc[-1])
+                    atr_ratio = atr_cur / atr_mean if atr_mean > 0 else 1.0
                     if atr_ratio < self.ATR_RATIO_MIN:
                         logger.info(
                             f"[SKIP:LOW_VOL] {self.symbol} — "
-                            f"ATR_ratio={atr_ratio:.2f} < {self.ATR_RATIO_MIN:.1f}"
+                            f"ATR_ratio={atr_ratio:.2f} < {self.ATR_RATIO_MIN:.2f}"
                         )
+                        # Still update eval time so we don't spam this check
+                        self._last_eval_time = time.monotonic()
                         return
 
             # ── Signal ────────────────────────────────────────────────────
-            prediction = self.model.predict(df)
+            prediction = self.model.predict(df, df_1h=df_1h)
+            self._last_eval_time = time.monotonic()
+
             logger.info(
                 f"[SIGNAL] {self.symbol} → {prediction.signal.value} | "
                 f"conf={prediction.confidence:.0%} | {prediction.source}"
@@ -200,31 +277,36 @@ class FuturesTrader:
 
             side = OrderSide.LONG if prediction.signal == Signal.LONG else OrderSide.SHORT
 
-            # ── Effective threshold (regime + recalibrator adjustments) ───
-            # Regime raises/lowers threshold based on market structure.
-            # Recalibrator raises/lowers further based on LIVE win rate.
-            base_threshold    = settings.model.confidence_threshold
-            regime_adj        = regime_params.conf_thr_delta
-            recalib_adj       = self.recalibrator.get_threshold_adjustment(
-                                    self.symbol, side.value) / 100.0  # convert pp to decimal
-            eff_threshold     = min(0.95, base_threshold + regime_adj + recalib_adj)
+            # ── Effective threshold ───────────────────────────────────────
+            eff_threshold = self._effective_threshold(regime_params, side)
 
             if prediction.confidence < eff_threshold:
                 logger.info(
-                    f"[SKIP] {self.symbol} — conf {prediction.confidence:.0%} "
-                    f"< threshold {eff_threshold:.0%} "
-                    f"(base={base_threshold:.0%} regime={regime_adj:+.0%} recalib={recalib_adj:+.0%})"
+                    f"[SKIP:CONF] {self.symbol} — "
+                    f"conf={prediction.confidence:.0%} < threshold={eff_threshold:.0%} "
+                    f"(base={self.BASE_THRESHOLD:.0%} "
+                    f"regime={regime_params.conf_thr_delta:+.0%})"
                 )
                 return
 
-            # AGREE-only filter when regime requires it
-            agreement = prediction.reasoning.split("]")[0].replace("[HYBRID ", "") if "]" in prediction.reasoning else ""
+            # ── AGREE filter (TRENDING regime only) ───────────────────────
+            agreement = ""
+            if "]" in prediction.reasoning:
+                agreement = prediction.reasoning.split("]")[0].replace("[HYBRID ", "")
+
             if regime_params.require_agree and "AGREE" not in agreement:
-                logger.info(
-                    f"[SKIP:SPLIT] {self.symbol} — regime requires AGREE. "
-                    f"Signal={prediction.signal.value} conf={prediction.confidence:.0%}"
-                )
-                return
+                # SPLIT in TRENDING — allow if confidence is strong enough
+                if prediction.confidence >= eff_threshold + 0.08:
+                    logger.info(
+                        f"[SPLIT:STRONG] {self.symbol} — TRENDING but high conf "
+                        f"{prediction.confidence:.0%}, proceeding"
+                    )
+                else:
+                    logger.info(
+                        f"[SKIP:SPLIT] {self.symbol} — TRENDING requires AGREE. "
+                        f"conf={prediction.confidence:.0%}"
+                    )
+                    return
 
             # ── Risk checks ───────────────────────────────────────────────
             balance    = await self.exchange.get_balance()
@@ -287,10 +369,7 @@ class FuturesTrader:
         entry = self._entry_price
         side  = pos.side
 
-        sl_dist = abs(entry - self._sl_price)
-        if sl_dist == 0:
-            sl_dist = 1.0
-
+        sl_dist   = abs(entry - self._sl_price) or 1.0
         current_r = (
             (current_price - entry) / sl_dist if side == OrderSide.LONG
             else (entry - current_price) / sl_dist
@@ -305,17 +384,15 @@ class FuturesTrader:
         )
 
         # ── TP hit ────────────────────────────────────────────────────────
-        tp_hit = (current_price >= self._tp_price if side == OrderSide.LONG
-                  else current_price <= self._tp_price)
-        if tp_hit:
+        if (current_price >= self._tp_price if side == OrderSide.LONG
+                else current_price <= self._tp_price):
             logger.info(f"[TP HIT] {self.symbol}")
             await self._close_position("TP", pos.unrealized_pnl, current_r, regime_params)
             return
 
         # ── SL hit ────────────────────────────────────────────────────────
-        sl_hit = (current_price <= self._sl_price if side == OrderSide.LONG
-                  else current_price >= self._sl_price)
-        if sl_hit:
+        if (current_price <= self._sl_price if side == OrderSide.LONG
+                else current_price >= self._sl_price):
             logger.info(f"[SL HIT] {self.symbol}")
             await self._close_position("SL", pos.unrealized_pnl, current_r, regime_params)
             return
@@ -330,8 +407,7 @@ class FuturesTrader:
             if partial_qty > 0:
                 logger.info(
                     f"[PARTIAL TP] {self.symbol} — R={current_r:+.2f} | "
-                    f"closing {partial_qty}/{pos.quantity} | "
-                    f"PnL={pos.unrealized_pnl:+.4f}"
+                    f"closing {partial_qty}/{pos.quantity}"
                 )
                 result = await self.exchange.close_position_partial(
                     symbol=self.symbol, quantity=partial_qty
@@ -342,11 +418,11 @@ class FuturesTrader:
                     self._breakeven_moved    = True
                     logger.info(f"[PARTIAL TP OK] {self.symbol} SL → breakeven {self._sl_price:.4f}")
                 else:
-                    logger.info(f"[PARTIAL TP FALLBACK] {self.symbol} — full close at R={current_r:+.2f}")
+                    logger.info(f"[PARTIAL TP FALLBACK] {self.symbol} — full close")
                     await self._close_position("PARTIAL_TP_FULL", pos.unrealized_pnl, current_r, regime_params)
                     return
 
-        # ── Breakeven trailing stop ───────────────────────────────────────
+        # ── Breakeven trailing ────────────────────────────────────────────
         if not self._breakeven_moved and current_r >= self.BREAKEVEN_TRIGGER_R:
             new_sl = entry + 0.0001 if side == OrderSide.LONG else entry - 0.0001
             if abs(new_sl - self._sl_price) > 0.0001:
@@ -441,10 +517,7 @@ class FuturesTrader:
                 f"[CLOSED:{reason}] {self.symbol} | "
                 f"PnL={pnl:+.4f} USDT | R={pnl_r:+.2f} | bars={self._bars_held}"
             )
-
-            # Feed outcome into recalibrator
-            regime_name = (regime_params.regime.value
-                           if regime_params else "UNKNOWN")
+            regime_name = regime_params.regime.value if regime_params else "UNKNOWN"
             self.recalibrator.record_trade(
                 symbol=self.symbol,
                 side=self._position_side.value if self._position_side else "unknown",
@@ -463,7 +536,7 @@ class FuturesTrader:
         self._reset_position_state()
         self._cooldown_bars_remaining = self.COOLDOWN_BARS
 
-    # ── State management ──────────────────────────────────────────────────
+    # ── State ─────────────────────────────────────────────────────────────
 
     def _reset_position_state(self):
         self._in_position        = False
@@ -475,7 +548,7 @@ class FuturesTrader:
         self._bars_held          = 0
         self._breakeven_moved    = False
         self._partial_exit_taken = False
-        self._last_candle_ts     = None   # reset so first cycle after cooldown re-evaluates
+        self._last_eval_time     = 0.0   # force immediate signal eval after cooldown
 
     # ── Utilities ─────────────────────────────────────────────────────────
 

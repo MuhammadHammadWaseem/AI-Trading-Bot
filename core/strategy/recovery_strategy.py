@@ -114,7 +114,7 @@ class RecoveryStrategy:
         if state.last_loss_time:
             from datetime import timedelta
             elapsed = (datetime.now() - state.last_loss_time).total_seconds() / 60
-            if elapsed < 2:   # Wait at least 2 min before recovery
+            if elapsed < 0:   # No cooldown — valid signals should not be blocked
                 return False
 
         # Check signal confidence

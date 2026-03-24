@@ -1,26 +1,20 @@
 """
 core/models/ml_model.py
 ------------------------
-Production-grade ML model using LightGBM + XGBoost ensemble.
-Trained on millions of candles across multiple timeframes.
-Target accuracy: 55-65%+ on real market data.
+Production ML model — LightGBM + XGBoost ensemble.
 
-Features:
-- Multi-timeframe features (15m + 1h + 4h)
-- 80+ engineered features per candle
-- LightGBM + XGBoost ensemble with soft voting
-- Walk-forward validation (no data leakage)
-- Automatic feature importance analysis
+predict() uses engineer_features() from models/training/trainer.py
+(same feature set the model was trained on), then pads any missing
+HTF/regime columns with zeros so it works even without 1h candles.
 """
 
 import numpy as np
 import pandas as pd
 import joblib
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import List, Optional
 
 from sklearn.preprocessing import RobustScaler
-from sklearn.metrics import accuracy_score, classification_report
 
 from core.models.base_model import BaseModel, PredictionResult, Signal
 from data.indicators import get_feature_columns, add_all_indicators
@@ -30,21 +24,147 @@ from config.settings import settings
 logger = get_logger(__name__)
 
 
-def _try_import_boosting():
-    """Try to import LightGBM and XGBoost."""
-    lgbm, xgb = None, None
-    try:
-        import lightgbm as lgbm_lib
-        lgbm = lgbm_lib
-    except ImportError:
-        pass
-    try:
-        import xgboost as xgb_lib
-        xgb = xgb_lib
-    except ImportError:
-        pass
-    return lgbm, xgb
+# ── Feature engineering (must match models/training/trainer.py) ───────────────
 
+def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build the same 129-feature matrix used during training.
+    Uses pd.concat to avoid DataFrame fragmentation warnings.
+    Missing HTF/regime columns are filled with 0 at predict time.
+    """
+    cols = {}
+
+    # ── Base indicator columns ─────────────────────────────────────────────
+    for col in get_feature_columns():
+        if col in df.columns:
+            cols[col] = df[col]
+
+    # ── Multi-period returns ───────────────────────────────────────────────
+    for p in [1, 3, 5, 10, 20]:
+        cols[f"return_{p}"]   = df["close"].pct_change(p)
+        cols[f"log_ret_{p}"]  = np.log(df["close"] / (df["close"].shift(p) + 1e-10))
+        cols[f"hl_range_{p}"] = (
+            df["high"].rolling(p).max() - df["low"].rolling(p).min()
+        ) / (df["close"] + 1e-10)
+
+    # ── Rolling z-scores on oscillators ───────────────────────────────────
+    for col in ["rsi", "macd", "adx", "volume"]:
+        if col not in df.columns:
+            continue
+        for w in [5, 10, 20]:
+            rm = df[col].rolling(w).mean()
+            rs = df[col].rolling(w).std()
+            cols[f"{col}_ma{w}"]  = rm
+            cols[f"{col}_std{w}"] = rs
+            cols[f"{col}_z{w}"]   = (df[col] - rm) / (rs + 1e-10)
+
+    # ── Indicator crossover signals ────────────────────────────────────────
+    if "rsi" in df.columns:
+        cols["rsi_oversold"]       = (df["rsi"] < 30).astype(int)
+        cols["rsi_overbought"]     = (df["rsi"] > 70).astype(int)
+        cols["rsi_mid_cross_up"]   = ((df["rsi"] > 50) & (df["rsi"].shift(1) <= 50)).astype(int)
+        cols["rsi_mid_cross_down"] = ((df["rsi"] < 50) & (df["rsi"].shift(1) >= 50)).astype(int)
+
+    if "macd" in df.columns and "macd_signal" in df.columns:
+        cols["macd_cross_up"]    = ((df["macd"] > df["macd_signal"]) & (df["macd"].shift(1) <= df["macd_signal"].shift(1))).astype(int)
+        cols["macd_cross_down"]  = ((df["macd"] < df["macd_signal"]) & (df["macd"].shift(1) >= df["macd_signal"].shift(1))).astype(int)
+        cols["macd_positive"]    = (df["macd"] > 0).astype(int)
+
+    if "macd_hist" in df.columns:
+        cols["macd_hist_rising"] = (df["macd_hist"] > df["macd_hist"].shift(1)).astype(int)
+
+    if "ema_9" in df.columns and "ema_21" in df.columns:
+        cols["ema_9_21_cross_up"]   = ((df["ema_9"] > df["ema_21"]) & (df["ema_9"].shift(1) <= df["ema_21"].shift(1))).astype(int)
+        cols["ema_9_21_cross_down"] = ((df["ema_9"] < df["ema_21"]) & (df["ema_9"].shift(1) >= df["ema_21"].shift(1))).astype(int)
+
+    # ── BB squeeze ────────────────────────────────────────────────────────
+    if "bb_width" in df.columns:
+        cols["bb_squeeze"] = (df["bb_width"] < df["bb_width"].rolling(20).quantile(0.20)).astype(int)
+
+    # ── ATR features ──────────────────────────────────────────────────────
+    if "atr" in df.columns:
+        cols["atr_ratio"] = df["atr"] / (df["close"] + 1e-10)
+        cols["atr_z20"]   = (df["atr"] - df["atr"].rolling(20).mean()) / (df["atr"].rolling(20).std() + 1e-10)
+
+    # ── Volume features ────────────────────────────────────────────────────
+    if "volume" in df.columns:
+        cols["vol_price_momentum"] = df["close"].pct_change() * np.log1p(df["volume"])
+        cols["vol_spike"]          = df["volume"] / (df["volume"].rolling(20).mean() + 1e-10)
+
+    # ── Regime features (computed from 5m data) ───────────────────────────
+    if "adx" in df.columns:
+        cols["regime_trending"] = (df["adx"] > 25).astype(int)
+        cols["regime_strong"]   = (df["adx"] > 40).astype(int)
+        cols["regime_weak"]     = (df["adx"] < 20).astype(int)
+
+    if "bb_width" in df.columns:
+        bw_pct = df["bb_width"].rolling(50).rank(pct=True)
+        cols["regime_squeeze"]   = (bw_pct < 0.20).astype(int)
+        cols["regime_expansion"] = (bw_pct > 0.80).astype(int)
+
+    if "close" in df.columns:
+        ret_vol = df["close"].pct_change().rolling(20).std()
+        vol_pct = ret_vol.rolling(100).rank(pct=True)
+        ret_20  = df["close"].pct_change(20)
+        cols["regime_high_vol"] = (vol_pct > 0.70).astype(int)
+        cols["regime_low_vol"]  = (vol_pct < 0.30).astype(int)
+        cols["regime_bull_20"]  = (ret_20 > 0).astype(int)
+        cols["regime_bear_20"]  = (ret_20 < 0).astype(int)
+
+    f = pd.concat(cols, axis=1)
+    f = f.replace([np.inf, -np.inf], np.nan)
+    return f
+
+
+def _add_htf_features(feat_df: pd.DataFrame, df_1h: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """
+    Add 1h HTF features aligned to the 5m index.
+    If df_1h is None (not available at prediction time), columns are zero-filled.
+    """
+    htf_cols = [
+        "htf1h_trend", "htf1h_rsi", "htf1h_rsi_zone",
+        "htf1h_macd_hist", "htf1h_macd_bull",
+        "htf1h_adx", "htf1h_trending",
+        "htf1h_bb_pct", "htf1h_above_50ema",
+    ]
+
+    if df_1h is not None and not df_1h.empty:
+        try:
+            df_1h_ind = add_all_indicators(df_1h.copy())
+            htf = pd.DataFrame(index=df_1h_ind.index)
+            if "ema_9" in df_1h_ind.columns and "ema_21" in df_1h_ind.columns:
+                htf["htf1h_trend"] = np.where(df_1h_ind["ema_9"] > df_1h_ind["ema_21"], 1, -1)
+            if "rsi" in df_1h_ind.columns:
+                htf["htf1h_rsi"]      = df_1h_ind["rsi"]
+                htf["htf1h_rsi_zone"] = pd.cut(
+                    df_1h_ind["rsi"], bins=[0, 30, 45, 55, 70, 100],
+                    labels=[-2, -1, 0, 1, 2]
+                ).astype(float)
+            if "macd_hist" in df_1h_ind.columns:
+                htf["htf1h_macd_hist"] = df_1h_ind["macd_hist"]
+                htf["htf1h_macd_bull"] = (df_1h_ind["macd_hist"] > 0).astype(int)
+            if "adx" in df_1h_ind.columns:
+                htf["htf1h_adx"]      = df_1h_ind["adx"]
+                htf["htf1h_trending"] = (df_1h_ind["adx"] > 25).astype(int)
+            if "bb_pct" in df_1h_ind.columns:
+                htf["htf1h_bb_pct"] = df_1h_ind["bb_pct"]
+            if "close" in df_1h_ind.columns and "ema_50" in df_1h_ind.columns:
+                htf["htf1h_above_50ema"] = (df_1h_ind["close"] > df_1h_ind["ema_50"]).astype(int)
+
+            aligned = htf.reindex(feat_df.index, method="ffill")
+            for col in htf_cols:
+                feat_df[col] = aligned.get(col, pd.Series(0, index=feat_df.index))
+            return feat_df
+        except Exception as e:
+            logger.debug(f"HTF feature build failed ({e}), using zeros")
+
+    # Fallback: fill all HTF columns with 0
+    for col in htf_cols:
+        feat_df[col] = 0
+    return feat_df
+
+
+# ── MLModel class ─────────────────────────────────────────────────────────────
 
 class MLModel(BaseModel):
 
@@ -56,9 +176,9 @@ class MLModel(BaseModel):
         self.model_dir = model_dir or settings.model.saved_models_dir
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
-        self._models     = []   # List of (name, model) tuples
-        self._scaler     = None
-        self._is_trained = False
+        self._models:        list      = []
+        self._scaler:        Optional[RobustScaler] = None
+        self._is_trained:    bool      = False
         self._feature_names: List[str] = []
         self._try_load()
 
@@ -66,237 +186,12 @@ class MLModel(BaseModel):
     def _model_path(self) -> Path:
         return self.model_dir / f"ml_{self.symbol}.joblib"
 
-    @property
-    def _scaler_path(self) -> Path:
-        return self.model_dir / f"scaler_{self.symbol}.joblib"
-
-    def _engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
+    def predict(self, df: pd.DataFrame, df_1h: Optional[pd.DataFrame] = None) -> PredictionResult:
         """
-        Build 80+ features from OHLCV + indicators.
-        Includes price action, momentum, volatility, volume, and pattern features.
+        Predict signal from 5m OHLCV+indicator DataFrame.
+        Optionally accepts df_1h for HTF features (improves accuracy).
+        If df_1h is None, HTF features default to 0 (neutral).
         """
-        f = pd.DataFrame(index=df.index)
-
-        # ── Base indicator features ────────────────────────────────────────
-        for col in get_feature_columns():
-            if col in df.columns:
-                f[col] = df[col]
-
-        # ── Price action features ──────────────────────────────────────────
-        f["candle_body"]     = (df["close"] - df["open"]) / df["open"]
-        f["candle_upper_wick"] = (df["high"] - df[["open","close"]].max(axis=1)) / (df["high"] - df["low"] + 1e-9)
-        f["candle_lower_wick"] = (df[["open","close"]].min(axis=1) - df["low"]) / (df["high"] - df["low"] + 1e-9)
-        f["is_bullish"]      = (df["close"] > df["open"]).astype(int)
-
-        # ── Returns over multiple periods ─────────────────────────────────
-        for p in [1, 3, 5, 10, 20]:
-            f[f"return_{p}"]   = df["close"].pct_change(p)
-            f[f"hl_range_{p}"] = (df["high"].rolling(p).max() - df["low"].rolling(p).min()) / df["close"]
-
-        # ── Rolling statistics ─────────────────────────────────────────────
-        for col in ["rsi", "macd", "adx", "volume"]:
-            if col in df.columns:
-                for w in [5, 10, 20]:
-                    f[f"{col}_ma{w}"]   = df[col].rolling(w).mean()
-                    f[f"{col}_std{w}"]  = df[col].rolling(w).std()
-                    f[f"{col}_vs_ma{w}"] = df[col] / (df[col].rolling(w).mean() + 1e-9) - 1
-
-        # ── Momentum features ──────────────────────────────────────────────
-        f["rsi_oversold"]    = (df["rsi"] < 30).astype(int) if "rsi" in df.columns else 0
-        f["rsi_overbought"]  = (df["rsi"] > 70).astype(int) if "rsi" in df.columns else 0
-        f["macd_cross_up"]   = ((df["macd"] > df["macd_signal"]) & 
-                                 (df["macd"].shift(1) <= df["macd_signal"].shift(1))).astype(int) \
-                                 if "macd" in df.columns and "macd_signal" in df.columns else 0
-        f["macd_cross_down"] = ((df["macd"] < df["macd_signal"]) & 
-                                 (df["macd"].shift(1) >= df["macd_signal"].shift(1))).astype(int) \
-                                 if "macd" in df.columns and "macd_signal" in df.columns else 0
-
-        # ── Volatility features ────────────────────────────────────────────
-        f["volatility_10"]   = df["close"].pct_change().rolling(10).std()
-        f["volatility_20"]   = df["close"].pct_change().rolling(20).std()
-        f["atr_ratio"]       = df["atr"] / df["close"] if "atr" in df.columns else 0
-
-        # ── Volume features ────────────────────────────────────────────────
-        f["volume_spike"]    = df["volume"] / (df["volume"].rolling(20).mean() + 1e-9)
-        f["price_volume"]    = df["close"].pct_change() * np.log1p(df["volume"])
-
-        # ── Time features ──────────────────────────────────────────────────
-        f["hour"]            = df.index.hour / 24.0 if hasattr(df.index, 'hour') else 0
-        f["day_of_week"]     = df.index.dayofweek / 6.0 if hasattr(df.index, 'dayofweek') else 0
-
-        # Drop NaN rows
-        f = f.replace([np.inf, -np.inf], np.nan)
-        return f
-
-    def _generate_labels(self, df: pd.DataFrame,
-                          future_candles: int = 12,
-                          threshold: float = 0.008) -> np.ndarray:
-        """
-        Generate labels with forward-looking return.
-
-        Parameters calibrated for 5m candles:
-          future_candles=12  — look 1 hour ahead (12 × 5m = 60 min)
-                               On 15m this was 4 candles = 1 hour. Same window.
-          threshold=0.8%     — require 0.8% move to label LONG/SHORT.
-                               On 5m, 0.8% in 1 hour filters out noise moves.
-                               This raises HOLD% from ~26% to ~45%, reducing
-                               the SHORT bias that caused Sharpe=-10 at 5m.
-
-        Label distribution target with these params:
-          HOLD  ~40-50%  (ambiguous/ranging periods)
-          LONG  ~25-30%  (clear upward hour ahead)
-          SHORT ~25-30%  (clear downward hour ahead)
-        """
-        closes = df["close"].values
-        labels = np.zeros(len(closes), dtype=int)
-        for i in range(len(closes) - future_candles):
-            ret = (closes[i + future_candles] - closes[i]) / closes[i]
-            if ret > threshold:
-                labels[i] = 1   # LONG
-            elif ret < -threshold:
-                labels[i] = 2   # SHORT
-            # else 0 = HOLD
-        return labels
-
-    def train(self, df: pd.DataFrame, **kwargs):
-        """
-        Train LightGBM + XGBoost ensemble.
-        Falls back to GradientBoosting if neither is installed.
-        """
-        print(f"\n  >> [ML] Building features for {self.symbol} | {len(df)} candles...")
-
-        feat_df = self._engineer_features(df)
-        labels  = self._generate_labels(df)
-
-        # Align
-        valid_mask = ~feat_df.isnull().any(axis=1)
-        feat_df    = feat_df[valid_mask]
-        labels     = labels[valid_mask.values]
-
-        # Remove last N rows (no valid labels — future window not yet closed)
-        cutoff  = 12   # must match future_candles in _generate_labels
-        feat_df = feat_df.iloc[:-cutoff]
-        labels  = labels[:-cutoff]
-
-        self._feature_names = feat_df.columns.tolist()
-        X = feat_df.values.astype(np.float32)
-        y = labels
-
-        print(f"  >> [ML] Samples={len(X):,} | Features={X.shape[1]} | "
-              f"HOLD={np.sum(y==0):,} LONG={np.sum(y==1):,} SHORT={np.sum(y==2):,}")
-
-        # Walk-forward split (no shuffle — time series)
-        split = int(len(X) * 0.80)
-        X_train, X_val = X[:split], X[split:]
-        y_train, y_val = y[:split], y[split:]
-
-        self._scaler = RobustScaler()
-        X_train_s    = self._scaler.fit_transform(X_train)
-        X_val_s      = self._scaler.transform(X_val)
-
-        lgbm, xgb = _try_import_boosting()
-        self._models = []
-
-        # ── LightGBM ───────────────────────────────────────────────────────
-        if lgbm:
-            print(f"  >> [ML] Training LightGBM...")
-            lgb_model = lgbm.LGBMClassifier(
-                n_estimators=500,
-                learning_rate=0.05,
-                max_depth=6,
-                num_leaves=63,
-                min_child_samples=50,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                class_weight="balanced",
-                random_state=42,
-                n_jobs=-1,
-                verbose=-1,
-            )
-            lgb_model.fit(
-                X_train_s, y_train,
-                eval_set=[(X_val_s, y_val)],
-                callbacks=[lgbm.early_stopping(50, verbose=False),
-                           lgbm.log_evaluation(100)],
-            )
-            acc = accuracy_score(y_val, lgb_model.predict(X_val_s))
-            print(f"  >> [ML] LightGBM val_accuracy={acc:.2%}")
-            self._models.append(("lgbm", lgb_model, 0.5))
-
-        # ── XGBoost ────────────────────────────────────────────────────────
-        if xgb:
-            print(f"  >> [ML] Training XGBoost...")
-            xgb_model = xgb.XGBClassifier(
-                n_estimators=500,
-                learning_rate=0.05,
-                max_depth=5,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                use_label_encoder=False,
-                eval_metric="mlogloss",
-                random_state=42,
-                n_jobs=-1,
-                verbosity=0,
-            )
-            xgb_model.fit(
-                X_train_s, y_train,
-                eval_set=[(X_val_s, y_val)],
-                early_stopping_rounds=50,
-                verbose=False,
-            )
-            acc = accuracy_score(y_val, xgb_model.predict(X_val_s))
-            print(f"  >> [ML] XGBoost val_accuracy={acc:.2%}")
-            self._models.append(("xgb", xgb_model, 0.5))
-
-        # ── Fallback: sklearn GradientBoosting ────────────────────────────
-        if not self._models:
-            print(f"  >> [ML] Using GradientBoosting (install lightgbm/xgboost for better accuracy)...")
-            from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-            gb = GradientBoostingClassifier(n_estimators=300, max_depth=5,
-                                            learning_rate=0.05, random_state=42)
-            rf = RandomForestClassifier(n_estimators=200, max_depth=8,
-                                        class_weight="balanced", random_state=42, n_jobs=-1)
-            gb.fit(X_train_s, y_train)
-            rf.fit(X_train_s, y_train)
-            acc_gb = accuracy_score(y_val, gb.predict(X_val_s))
-            acc_rf = accuracy_score(y_val, rf.predict(X_val_s))
-            print(f"  >> [ML] GB={acc_gb:.2%} RF={acc_rf:.2%}")
-            self._models.append(("gb", gb, 0.6))
-            self._models.append(("rf", rf, 0.4))
-
-        # ── Final ensemble evaluation ──────────────────────────────────────
-        final_probs = self._ensemble_predict_proba(X_val_s)
-        final_preds = np.argmax(final_probs, axis=1)
-        final_acc   = accuracy_score(y_val, final_preds)
-
-        print(f"\n  >> [ML] ENSEMBLE val_accuracy={final_acc:.2%}")
-        print(classification_report(y_val, final_preds,
-                                    target_names=["HOLD","LONG","SHORT"], zero_division=0))
-
-        self._is_trained = True
-        self._save()
-        logger.info(f"ML training complete: {self.symbol} | accuracy={final_acc:.2%}")
-
-        class FakeHistory:
-            history = {"val_accuracy": [final_acc]}
-        return FakeHistory()
-
-    def _ensemble_predict_proba(self, X_scaled: np.ndarray) -> np.ndarray:
-        """Weighted soft voting across all models."""
-        total_weight = sum(w for _, _, w in self._models)
-        probs = None
-        for name, model, weight in self._models:
-            p = model.predict_proba(X_scaled) * (weight / total_weight)
-            # Ensure 3 classes
-            if p.shape[1] < 3:
-                full = np.zeros((len(p), 3))
-                for i, cls in enumerate(model.classes_):
-                    full[:, cls] = p[:, i]
-                p = full
-            probs = p if probs is None else probs + p
-        return probs
-
-    def predict(self, df: pd.DataFrame) -> PredictionResult:
         if not self._is_trained or not self._models:
             return PredictionResult(
                 signal=Signal.HOLD, confidence=0.0,
@@ -304,8 +199,19 @@ class MLModel(BaseModel):
                 source="ml", reasoning="Model not trained",
             )
         try:
-            feat_df = self._engineer_features(df)
+            # Build features matching training
+            feat_df = _engineer_features(df)
+            feat_df = _add_htf_features(feat_df, df_1h)
+
+            # Align exactly to saved feature names — fill missing cols with 0
+            missing = [c for c in self._feature_names if c not in feat_df.columns]
+            if missing:
+                logger.debug(f"Filling {len(missing)} missing features with 0: {missing[:5]}...")
+                for col in missing:
+                    feat_df[col] = 0
+
             feat_df = feat_df[self._feature_names]
+
             # Use last valid row
             last_row = feat_df.dropna().iloc[[-1]]
             if last_row.empty:
@@ -332,26 +238,45 @@ class MLModel(BaseModel):
                 source="ml", reasoning=f"Error: {e}",
             )
 
-    def _save(self):
-        payload = {
-            "models":        self._models,
-            "scaler":        self._scaler,
-            "feature_names": self._feature_names,
-        }
-        joblib.dump(payload, self._model_path)
-        logger.info(f"Model saved: {self._model_path}")
+    def _ensemble_predict_proba(self, X_scaled: np.ndarray) -> np.ndarray:
+        total_weight = sum(w for _, _, w in self._models)
+        probs = None
+        for _, model, weight in self._models:
+            p = model.predict_proba(X_scaled) * (weight / total_weight)
+            if p.shape[1] < 3:
+                full = np.zeros((len(p), 3))
+                for i, cls in enumerate(model.classes_):
+                    full[:, cls] = p[:, i]
+                p = full
+            probs = p if probs is None else probs + p
+        return probs
 
     def _try_load(self):
-        if self._model_path.exists():
-            try:
-                payload          = joblib.load(self._model_path)
-                self._models     = payload["models"]
-                self._scaler     = payload["scaler"]
-                self._feature_names = payload["feature_names"]
-                self._is_trained = True
-                logger.info(f"Model loaded: {self.symbol}")
-            except Exception as e:
-                logger.warning(f"Could not load model {self.symbol}: {e}")
+        if not self._model_path.exists():
+            return
+        try:
+            payload              = joblib.load(self._model_path)
+            self._models         = payload["models"]
+            self._scaler         = payload["scaler"]
+            self._feature_names  = payload["feature_names"]
+            self._is_trained     = True
+            wf_sharpe = payload.get("wf_sharpe", 0)
+            wf_f1     = payload.get("wf_f1", 0)
+            accepted  = payload.get("wf_accepted", True)
+            status    = "ACCEPTED" if accepted else "WF-REJECTED"
+            logger.info(
+                f"[ML] Loaded {self.symbol} ({status}) | "
+                f"Sharpe={wf_sharpe:.2f}  F1={wf_f1:.3f} | "
+                f"{len(self._feature_names)} features"
+            )
+            if not accepted:
+                logger.warning(
+                    f"[ML] {self.symbol} WF-REJECTED but saved anyway (bot needs a model) | "
+                    f"Sharpe={wf_sharpe:.2f}  F1={wf_f1:.3f} | "
+                    f"Path: {self._model_path}"
+                )
+        except Exception as e:
+            logger.warning(f"Could not load model {self.symbol}: {e}")
 
     @property
     def is_trained(self) -> bool:
@@ -360,3 +285,88 @@ class MLModel(BaseModel):
     def get_model_name(self) -> str:
         names = "+".join(n for n, _, _ in self._models)
         return f"Ensemble({names})_{self.symbol}"
+
+    # ── train() kept for backward compatibility with scripts/trainer.py ───────
+    def train(self, df: pd.DataFrame, **kwargs):
+        """
+        Inline training path (used by scripts/train_all.py, not train_from_history.py).
+        For production training use scripts/train_from_history.py instead.
+        """
+        from sklearn.metrics import accuracy_score, classification_report as cr
+        try:
+            import lightgbm as lgbm
+        except ImportError:
+            lgbm = None
+        try:
+            import xgboost as xgb
+        except ImportError:
+            xgb = None
+
+        print(f"\n  >> [ML] Building features for {self.symbol} | {len(df)} candles...")
+        feat_df = _engineer_features(df)
+        feat_df = _add_htf_features(feat_df, None)  # no HTF in inline training
+
+        # Simple threshold labels (inline training only)
+        closes = df["close"].values
+        labels = np.zeros(len(closes), dtype=int)
+        future_candles, threshold = 12, 0.008
+        for i in range(len(closes) - future_candles):
+            ret = (closes[i + future_candles] - closes[i]) / closes[i]
+            if ret > threshold:   labels[i] = 1
+            elif ret < -threshold: labels[i] = 2
+
+        valid_mask = ~feat_df.isnull().any(axis=1)
+        feat_df    = feat_df[valid_mask]
+        labels     = labels[valid_mask.values][:-future_candles]
+        feat_df    = feat_df.iloc[:-future_candles]
+
+        self._feature_names = feat_df.columns.tolist()
+        X = feat_df.values.astype(np.float32)
+        y = labels
+
+        split = int(len(X) * 0.80)
+        X_tr, X_val = X[:split], X[split:]
+        y_tr, y_val = y[:split], y[split:]
+
+        self._scaler  = RobustScaler()
+        X_tr_s  = self._scaler.fit_transform(X_tr)
+        X_val_s = self._scaler.transform(X_val)
+
+        self._models = []
+        if lgbm:
+            m = lgbm.LGBMClassifier(n_estimators=500, learning_rate=0.05, max_depth=6,
+                                     class_weight="balanced", random_state=42, n_jobs=-1, verbose=-1)
+            m.fit(X_tr_s, y_tr, eval_set=[(X_val_s, y_val)],
+                  callbacks=[lgbm.early_stopping(50, verbose=False), lgbm.log_evaluation(200)])
+            self._models.append(("lgbm", m, 0.55))
+        if xgb:
+            m = xgb.XGBClassifier(n_estimators=500, learning_rate=0.05, max_depth=5,
+                                   eval_metric="mlogloss", random_state=42, n_jobs=-1, verbosity=0)
+            m.fit(X_tr_s, y_tr, eval_set=[(X_val_s, y_val)],
+                  early_stopping_rounds=50, verbose=False)
+            self._models.append(("xgb", m, 0.45))
+        if not self._models:
+            from sklearn.ensemble import GradientBoostingClassifier
+            m = GradientBoostingClassifier(n_estimators=300, random_state=42)
+            m.fit(X_tr_s, y_tr)
+            self._models.append(("gb", m, 1.0))
+
+        self._is_trained = True
+        probs = self._ensemble_predict_proba(X_val_s)
+        preds = np.argmax(probs, axis=1)
+        acc   = accuracy_score(y_val, preds)
+        print(f"\n  >> [ML] ENSEMBLE val_accuracy={acc:.2%}")
+        print(cr(y_val, preds, target_names=["HOLD","LONG","SHORT"], zero_division=0))
+        self._save()
+
+        class FakeHistory:
+            history = {"val_accuracy": [acc]}
+        return FakeHistory()
+
+    def _save(self):
+        joblib.dump({
+            "models":        self._models,
+            "scaler":        self._scaler,
+            "feature_names": self._feature_names,
+        }, self._model_path)
+        logger.info(f"Model saved: {self._model_path}")
