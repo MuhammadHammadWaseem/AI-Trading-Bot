@@ -3,31 +3,37 @@ core/trader/futures_trader.py
 ──────────────────────────────
 Main trading orchestrator — one instance per symbol.
 
+v7 Changes (production-grade state reconciliation)
+────────────────────────────────────────────────────
+RECONCILIATION : Every cycle, before monitoring, the bot fetches live
+                 positions from Binance and compares against internal state.
+
+                 Three cases handled:
+                  A. Bot=open, Exchange=open  → normal monitoring.
+                  B. Bot=open, Exchange=none  → external close detected
+                     (SL/TP hit or liquidation). Estimates PnL from
+                     last-known unrealized_pnl, records trade, resets
+                     state cleanly, starts cooldown.
+                  C. Bot=closed, Exchange=open → rogue position. Warns
+                     loudly but does NOT manage it to avoid double-management.
+                  D. Both=closed → normal idle, continue to signal eval.
+
+PERIODIC SYNC  : Every FULL_SYNC_CYCLES (default 60 ≈ 5 min), a deep sync
+                 re-validates internal entry_price against exchange data and
+                 confirms SL/TP are still set.
+
+SL/TP GUARD    : After order placement, SL/TP are verified non-None. Missing
+                 values are logged as WARNING — position still lives, managed
+                 by timeout only.
+
 v6 Changes (filter calibration + execution frequency)
 ───────────────────────────────────────────────────────
-CANDLE GATE   : Upgraded from "5m candle only" to hybrid timing.
-                - Position monitoring: every cycle (unchanged, 2–5s).
-                - Signal evaluation: every SIGNAL_EVAL_SECONDS (default 60s)
-                  OR on a new 1m candle close, whichever comes first.
-                - High-confidence AGREE signals (>= FAST_ENTRY_CONF) bypass
-                  the wait and enter on the current cycle.
-                This replaces the pure 5m candle gate that was blocking all
-                signals until a new 5m candle, creating 0–5 minute dead zones.
-
-ATR GATE      : Relaxed from 1.0 to 0.90. Values of 0.93–0.98 are valid
-                trading conditions (near-average volatility), not dead zones.
-
-AGREE FILTER  : Only enforced in TRENDING regime (correct behavior).
-                RANGING and HIGH_VOL regimes allow SPLIT signals.
-
-THRESHOLD     : Base 0.55 (was 0.65). Regime adds ±delta as before.
-                Combined effective range: 0.52 – 0.65 depending on regime.
-
-SPLIT TRADES  : Allowed when confidence >= SPLIT_MIN_CONF (0.52).
-                Only blocked in TRENDING regime with require_agree=True.
-
-RECALIBRATOR  : Still active — adjusts threshold based on live win rate.
-                Capped at ±0.08 to prevent over-suppression on cold start.
+CANDLE GATE   : Hybrid 1m/60s timing gate replaces pure 5m gate.
+ATR GATE      : Relaxed from 1.0 to 0.90.
+AGREE FILTER  : TRENDING regime only.
+THRESHOLD     : Base 0.55. Effective range 0.52–0.65 by regime.
+SPLIT TRADES  : Allowed >= SPLIT_MIN_CONF (0.52) in non-TRENDING regimes.
+RECALIBRATOR  : Live win-rate tracker, capped at ±0.08pp.
 """
 
 from __future__ import annotations
@@ -35,6 +41,8 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Optional
+
+import pandas as pd
 
 from core.exchange.base_exchange import BaseExchange, OrderSide, PositionInfo
 from core.models.hybrid_model import HybridModel
@@ -57,40 +65,37 @@ def _normalize_symbol(symbol: str) -> str:
 class FuturesTrader:
 
     # ── Timeframes ────────────────────────────────────────────────────────
-    TIMEFRAME    = "5m"    # candles used for indicator computation
-    SIG_TIMEFRAME = "1m"  # candles used for fast signal timing gate
+    TIMEFRAME     = "5m"
+    SIG_TIMEFRAME = "1m"
 
     # ── Execution timing ──────────────────────────────────────────────────
-    # Evaluate a new signal if EITHER:
-    #   (a) a new 1m candle has closed, OR
-    #   (b) SIGNAL_EVAL_SECONDS seconds have elapsed since last evaluation
-    # High-confidence AGREE signals also bypass the wait entirely.
-    SIGNAL_EVAL_SECONDS = 60    # max gap between signal evaluations
-    FAST_ENTRY_CONF     = 0.72  # AGREE signals above this bypass timing gate
+    SIGNAL_EVAL_SECONDS = 60
+    FAST_ENTRY_CONF     = 0.72
 
-    # ── Position monitoring (every cycle) ─────────────────────────────────
-    # Timeout measured in 5m bars (same as before)
-    TIMEOUT_BARS: dict[Regime, int] = {
-        Regime.TRENDING:  24,   # 2h
-        Regime.RANGING:   12,   # 1h
-        Regime.HIGH_VOL:   8,   # 40min
+    # ── Position monitoring ────────────────────────────────────────────────
+    TIMEOUT_BARS: dict = {
+        Regime.TRENDING:  24,
+        Regime.RANGING:   12,
+        Regime.HIGH_VOL:   8,
     }
-    COOLDOWN_BARS = 3           # 5m bars after close before next entry
+    COOLDOWN_BARS = 3
 
-    # ── Partial TP / trailing stop ────────────────────────────────────────
+    # ── Partial TP / trailing ─────────────────────────────────────────────
     BREAKEVEN_TRIGGER_R  = 1.0
     PARTIAL_TP_R         = 1.0
     PARTIAL_TP_FRACTION  = 0.5
     MIN_HOLD_BARS        = 2
 
     # ── Volatility gate ───────────────────────────────────────────────────
-    # Relaxed from 1.0 to 0.90 — values 0.90–1.0 are near-average, still valid
     ATR_RATIO_MIN = 0.90
 
     # ── Confidence ────────────────────────────────────────────────────────
-    BASE_THRESHOLD    = 0.55    # was 0.65 — HybridModel now outputs 0.40–0.92
-    SPLIT_MIN_CONF    = 0.52    # minimum for SPLIT signal (no require_agree regime)
-    RECALIB_CAP       = 0.08    # max recalibrator adjustment (±pp)
+    BASE_THRESHOLD = 0.55
+    SPLIT_MIN_CONF = 0.52
+    RECALIB_CAP    = 0.08
+
+    # ── Reconciliation ────────────────────────────────────────────────────
+    FULL_SYNC_CYCLES = 60   # deep sync every ~5 min at 5s cycle
 
     def __init__(self, exchange, symbol, risk_manager, recovery_strategy,
                  recalibrator: Optional[SignalRecalibrator] = None):
@@ -108,22 +113,25 @@ class FuturesTrader:
 
         # Position state
         self._in_position        = False
-        self._tp_price:   Optional[float]       = None
-        self._sl_price:   Optional[float]       = None
+        self._tp_price:   Optional[float]        = None
+        self._sl_price:   Optional[float]        = None
         self._position_side: Optional[OrderSide] = None
-        self._entry_price: Optional[float]      = None
-        self._entry_confidence: float           = 0.0
+        self._entry_price:  Optional[float]      = None
+        self._entry_confidence: float            = 0.0
         self._bars_held          = 0
         self._breakeven_moved    = False
         self._partial_exit_taken = False
+
+        # Last-seen unrealized PnL — used to estimate PnL on external close
+        self._last_known_pnl: float = 0.0
 
         # Cooldown
         self._cooldown_bars_remaining = 0
 
         # Signal timing
-        self._last_1m_candle_ts: Optional[int]  = None   # 1m candle gate
-        self._last_5m_candle_ts: Optional[int]  = None   # bar counting
-        self._last_eval_time:    float           = 0.0    # wall-clock gate
+        self._last_1m_candle_ts: Optional[int]   = None
+        self._last_5m_candle_ts: Optional[int]   = None
+        self._last_eval_time:    float            = 0.0
         self._last_regime_params: Optional[RegimeParams] = None
 
     # ── Helpers ───────────────────────────────────────────────────────────
@@ -136,38 +144,148 @@ class FuturesTrader:
         return None
 
     def _effective_threshold(self, regime_params: RegimeParams, side: OrderSide) -> float:
-        """
-        Compute effective confidence threshold:
-          base (0.55) + regime_delta + recalibrator_delta (capped)
-        """
         recalib_adj = self.recalibrator.get_threshold_adjustment(
             self.symbol, side.value) / 100.0
         recalib_adj = max(-self.RECALIB_CAP, min(self.RECALIB_CAP, recalib_adj))
         eff = self.BASE_THRESHOLD + regime_params.conf_thr_delta + recalib_adj
-        return min(0.85, max(0.45, eff))   # hard clamp [0.45, 0.85]
+        return min(0.85, max(0.45, eff))
 
-    def _should_evaluate_signal(self, df_1m: Optional[pd.DataFrame], force: bool = False) -> bool:
-        """
-        Return True if it's time to run signal evaluation.
-        Conditions (any one suffices):
-          1. Forced (first cycle, after cooldown reset)
-          2. New 1m candle has closed
-          3. SIGNAL_EVAL_SECONDS have elapsed since last evaluation
-        """
+    def _should_evaluate_signal(self, df_1m, force: bool = False) -> bool:
         if force:
             return True
-
         now = time.monotonic()
         if now - self._last_eval_time >= self.SIGNAL_EVAL_SECONDS:
             return True
-
         if df_1m is not None and len(df_1m) > 0:
-            ts_1m = int(df_1m.index[-1].timestamp() * 1000) if hasattr(df_1m.index[-1], 'timestamp') else None
+            ts_1m = (int(df_1m.index[-1].timestamp() * 1000)
+                     if hasattr(df_1m.index[-1], 'timestamp') else None)
             if ts_1m is not None and ts_1m != self._last_1m_candle_ts:
                 self._last_1m_candle_ts = ts_1m
                 return True
-
         return False
+
+    # ── Reconciliation ────────────────────────────────────────────────────
+
+    async def _reconcile_position_state(
+        self,
+        current_pos:  Optional[PositionInfo],
+        current_price: float,
+        regime_params: Optional[RegimeParams],
+        new_5m_candle: bool,
+    ) -> bool:
+        """
+        Single source of truth for position state. Called every cycle
+        before any monitoring or signal logic.
+
+        Returns True  → position is confirmed open on exchange.
+        Returns False → no open position; proceed to signal evaluation.
+        """
+        exchange_has_pos = current_pos is not None
+        bot_thinks_open  = self._in_position
+
+        # ── Case A: both agree position is open ───────────────────────────
+        if bot_thinks_open and exchange_has_pos:
+            if new_5m_candle:
+                self._bars_held += 1
+            self._last_known_pnl = current_pos.unrealized_pnl
+            return True
+
+        # ── Case B: bot thinks open, exchange says closed ─────────────────
+        if bot_thinks_open and not exchange_has_pos:
+            estimated_pnl = self._last_known_pnl
+
+            # Best-guess exit reason
+            exit_reason = "EXTERNALLY_CLOSED"
+            if self._sl_price and self._tp_price and self._entry_price:
+                if self._position_side == OrderSide.LONG:
+                    if current_price >= self._tp_price:
+                        exit_reason = "TP_EXTERNAL"
+                    elif current_price <= self._sl_price:
+                        exit_reason = "SL_EXTERNAL"
+                else:
+                    if current_price <= self._tp_price:
+                        exit_reason = "TP_EXTERNAL"
+                    elif current_price >= self._sl_price:
+                        exit_reason = "SL_EXTERNAL"
+
+            logger.warning(
+                f"[RECONCILE:{exit_reason}] {self.symbol} — position vanished on exchange. "
+                f"estimated_pnl={estimated_pnl:+.4f} USDT | "
+                f"last_price={current_price:.4f} | bars_held={self._bars_held}"
+            )
+
+            # Record to recalibrator and risk manager
+            regime_name = regime_params.regime.value if regime_params else "UNKNOWN"
+            if estimated_pnl < 0:
+                self.recovery.record_loss(self.symbol, estimated_pnl)
+                self.risk.record_loss(estimated_pnl)
+            else:
+                self.recovery.record_profit(self.symbol, estimated_pnl)
+                self.risk.record_profit(estimated_pnl)
+
+            self.recalibrator.record_trade(
+                symbol=self.symbol,
+                side=self._position_side.value if self._position_side else "unknown",
+                won=(estimated_pnl >= 0),
+                confidence=self._entry_confidence,
+                pnl_usdt=estimated_pnl,
+                pnl_r=0.0,
+                bars_held=self._bars_held,
+                exit_reason=exit_reason,
+                regime=regime_name,
+            )
+
+            self.risk.portfolio.register_close(self.symbol, profit=(estimated_pnl >= 0))
+            self._reset_position_state()
+            self._cooldown_bars_remaining = self.COOLDOWN_BARS
+            return False
+
+        # ── Case C: bot thinks closed, exchange has rogue position ────────
+        if not bot_thinks_open and exchange_has_pos:
+            logger.warning(
+                f"[RECONCILE:ROGUE] {self.symbol} — unknown open position on exchange "
+                f"(side={current_pos.side.value}, qty={current_pos.quantity}, "
+                f"entry={current_pos.entry_price:.4f}). "
+                f"Bot will NOT manage this. Close it manually if needed."
+            )
+            return False  # Do not take over management
+
+        # ── Case D: both agree no position ────────────────────────────────
+        return False
+
+    async def _deep_sync(self, positions):
+        """
+        Periodic deep validation of internal state vs exchange.
+        Re-anchors entry price and checks SL/TP validity.
+        Runs every FULL_SYNC_CYCLES cycles.
+        """
+        current_pos = self._find_my_position(positions)
+
+        if self._in_position and current_pos:
+            # Re-anchor entry price if it diverged
+            if (self._entry_price is None
+                    or abs(self._entry_price - current_pos.entry_price) > 1.0):
+                old_entry = self._entry_price
+                self._entry_price = current_pos.entry_price
+                logger.info(
+                    f"[DEEP_SYNC] {self.symbol} — entry_price reanchored "
+                    f"{old_entry} → {current_pos.entry_price:.4f}"
+                )
+
+            # Validate SL/TP are set
+            if not self._sl_price or not self._tp_price:
+                logger.warning(
+                    f"[DEEP_SYNC] {self.symbol} — active position is missing SL/TP "
+                    f"(sl={self._sl_price}, tp={self._tp_price}). "
+                    f"Position will rely on timeout only."
+                )
+
+        logger.debug(
+            f"[DEEP_SYNC] {self.symbol} complete | "
+            f"bot_open={self._in_position} | "
+            f"exchange_pos={'YES' if current_pos else 'NO'} | "
+            f"bars={self._bars_held}"
+        )
 
     # ── Main cycle ────────────────────────────────────────────────────────
 
@@ -179,7 +297,7 @@ class FuturesTrader:
         logger.info(f"Cycle #{self._cycles} — {self.symbol}")
 
         try:
-            # ── Market data (5m for indicators + regime) ──────────────────
+            # ── Market data ───────────────────────────────────────────────
             candles = await self.exchange.get_ohlcv(self.symbol, self.TIMEFRAME, limit=200)
             if not candles or len(candles) < 50:
                 logger.warning(f"Insufficient candles for {self.symbol}")
@@ -189,7 +307,7 @@ class FuturesTrader:
             df            = add_all_indicators(df)
             current_price = float(df["close"].iloc[-1])
 
-            # ── 1h candles for HTF features (best-effort) ─────────────────
+            # 1h HTF features (best-effort)
             df_1h = None
             try:
                 c1h = await self.exchange.get_ohlcv(self.symbol, "1h", limit=100)
@@ -198,7 +316,7 @@ class FuturesTrader:
             except Exception:
                 pass
 
-            # ── 1m candles for signal timing gate (best-effort) ───────────
+            # 1m signal timing gate (best-effort)
             df_1m = None
             try:
                 c1m = await self.exchange.get_ohlcv(self.symbol, "1m", limit=5)
@@ -211,29 +329,35 @@ class FuturesTrader:
             regime_params = self.regime.detect(df)
             self._last_regime_params = regime_params
 
-            # ── Track 5m bars (for position hold/cooldown counting) ───────
-            ts_5m = int(df.index[-1].timestamp() * 1000) if hasattr(df.index[-1], 'timestamp') else self._cycles
+            # ── Track 5m bars ─────────────────────────────────────────────
+            ts_5m = (int(df.index[-1].timestamp() * 1000)
+                     if hasattr(df.index[-1], 'timestamp') else self._cycles)
             new_5m_candle = (ts_5m != self._last_5m_candle_ts)
             if new_5m_candle:
                 self._last_5m_candle_ts = ts_5m
 
-            # ── Check existing position ───────────────────────────────────
+            # ── Fetch live positions (single API call per cycle) ──────────
             positions   = await self.exchange.get_open_positions()
             current_pos = self._find_my_position(positions)
 
-            if current_pos:
-                self._in_position = True
-                if new_5m_candle:
-                    self._bars_held += 1
+            # ── Periodic deep sync ────────────────────────────────────────
+            if self._cycles % self.FULL_SYNC_CYCLES == 0:
+                await self._deep_sync(positions)
+
+            # ── Position reconciliation ───────────────────────────────────
+            # This is the single authoritative check. It compares bot state
+            # with exchange state and heals any divergence before we proceed.
+            position_is_open = await self._reconcile_position_state(
+                current_pos, current_price, regime_params, new_5m_candle
+            )
+
+            if position_is_open:
+                # current_pos is guaranteed non-None here (Case A)
                 await self._monitor_position(current_pos, current_price, df, regime_params)
                 return
 
-            # Position closed externally
-            if self._in_position:
-                logger.info(f"[CLOSED] {self.symbol} — ready for next trade")
-                self._reset_position_state()
+            # ── No position open — check cooldown then signals ────────────
 
-            # ── Cooldown ──────────────────────────────────────────────────
             if self._cooldown_bars_remaining > 0:
                 if new_5m_candle:
                     self._cooldown_bars_remaining -= 1
@@ -246,23 +370,22 @@ class FuturesTrader:
                 logger.info(f"[GATE] {self.symbol} — waiting for next eval window")
                 return
 
-            # ── Volatility gate (relaxed to 0.90) ─────────────────────────
+            # ── Volatility gate ───────────────────────────────────────────
             if "atr" in df.columns:
                 atr_s = df["atr"].dropna()
                 if len(atr_s) >= 20:
-                    atr_cur  = float(atr_s.iloc[-1])
-                    atr_mean = float(atr_s.rolling(20).mean().iloc[-1])
+                    atr_cur   = float(atr_s.iloc[-1])
+                    atr_mean  = float(atr_s.rolling(20).mean().iloc[-1])
                     atr_ratio = atr_cur / atr_mean if atr_mean > 0 else 1.0
                     if atr_ratio < self.ATR_RATIO_MIN:
                         logger.info(
                             f"[SKIP:LOW_VOL] {self.symbol} — "
                             f"ATR_ratio={atr_ratio:.2f} < {self.ATR_RATIO_MIN:.2f}"
                         )
-                        # Still update eval time so we don't spam this check
                         self._last_eval_time = time.monotonic()
                         return
 
-            # ── Signal ────────────────────────────────────────────────────
+            # ── Signal evaluation ─────────────────────────────────────────
             prediction = self.model.predict(df, df_1h=df_1h)
             self._last_eval_time = time.monotonic()
 
@@ -295,7 +418,6 @@ class FuturesTrader:
                 agreement = prediction.reasoning.split("]")[0].replace("[HYBRID ", "")
 
             if regime_params.require_agree and "AGREE" not in agreement:
-                # SPLIT in TRENDING — allow if confidence is strong enough
                 if prediction.confidence >= eff_threshold + 0.08:
                     logger.info(
                         f"[SPLIT:STRONG] {self.symbol} — TRENDING but high conf "
@@ -359,11 +481,18 @@ class FuturesTrader:
         regime_params: RegimeParams,
     ):
         if not (self._tp_price and self._sl_price and self._entry_price):
+            # Missing SL/TP — still log position status but skip SL/TP logic
             logger.info(
                 f"[WATCHING] {self.symbol} {pos.side.value.upper()} | "
                 f"entry={pos.entry_price:.4f} now={current_price:.4f} | "
-                f"PnL={pos.unrealized_pnl:+.4f} | bars={self._bars_held}"
+                f"PnL={pos.unrealized_pnl:+.4f} | bars={self._bars_held} "
+                f"[NO SL/TP — timeout only]"
             )
+            # Still enforce timeout even without SL/TP
+            max_bars = self._get_timeout(regime_params)
+            if self._bars_held >= max_bars:
+                logger.info(f"[TIMEOUT] {self.symbol} {max_bars} bars (no SL/TP mode)")
+                await self._close_position("TIMEOUT", pos.unrealized_pnl, 0.0, regime_params)
             return
 
         entry = self._entry_price
@@ -488,6 +617,16 @@ class FuturesTrader:
             self._bars_held           = 0
             self._breakeven_moved     = False
             self._partial_exit_taken  = False
+            self._last_known_pnl      = 0.0
+
+            # SL/TP guard — verify values are set after order placement
+            if not self._sl_price or not self._tp_price:
+                logger.warning(
+                    f"[SL/TP GUARD] {params.symbol} — SL or TP is None after "
+                    f"order placement (sl={self._sl_price}, tp={self._tp_price}). "
+                    f"Position will be managed by timeout only."
+                )
+
             self.risk.portfolio.register_open(self.symbol, params.side)
             logger.info(
                 f"[OPENED] #{self._trades_opened} {params.symbol} "
@@ -530,13 +669,35 @@ class FuturesTrader:
                 regime=regime_name,
             )
         else:
-            logger.error(f"[CLOSE FAILED] {self.symbol}: {result.message}")
+            # Exchange already closed it (race condition with SL/TP)
+            logger.warning(
+                f"[CLOSE FAILED] {self.symbol}: {result.message} — "
+                f"treating as externally closed, pnl={pnl:+.4f}"
+            )
+            if pnl < 0:
+                self.recovery.record_loss(self.symbol, pnl)
+                self.risk.record_loss(pnl)
+            else:
+                self.recovery.record_profit(self.symbol, pnl)
+                self.risk.record_profit(pnl)
+            regime_name = regime_params.regime.value if regime_params else "UNKNOWN"
+            self.recalibrator.record_trade(
+                symbol=self.symbol,
+                side=self._position_side.value if self._position_side else "unknown",
+                won=(pnl >= 0),
+                confidence=self._entry_confidence,
+                pnl_usdt=pnl,
+                pnl_r=pnl_r,
+                bars_held=self._bars_held,
+                exit_reason=f"{reason}_EXTERNAL",
+                regime=regime_name,
+            )
 
         self.risk.portfolio.register_close(self.symbol, profit=(pnl >= 0))
         self._reset_position_state()
         self._cooldown_bars_remaining = self.COOLDOWN_BARS
 
-    # ── State ─────────────────────────────────────────────────────────────
+    # ── State reset ───────────────────────────────────────────────────────
 
     def _reset_position_state(self):
         self._in_position        = False
@@ -548,7 +709,8 @@ class FuturesTrader:
         self._bars_held          = 0
         self._breakeven_moved    = False
         self._partial_exit_taken = False
-        self._last_eval_time     = 0.0   # force immediate signal eval after cooldown
+        self._last_known_pnl     = 0.0
+        self._last_eval_time     = 0.0   # force immediate eval after cooldown ends
 
     # ── Utilities ─────────────────────────────────────────────────────────
 
