@@ -4,6 +4,8 @@ scripts/run_bot.py — Main entry point.
 Usage:
     python scripts/run_bot.py
     python scripts/run_bot.py --pairs BTCUSDT ETHUSDT --leverage 10
+    python scripts/run_bot.py --interval 60
+    python scripts/run_bot.py --risk 0.5
     python scripts/run_bot.py --train
 """
 
@@ -20,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.exchange.exchange_factory import create_exchange
 from core.risk.risk_manager import RiskManager
 from core.strategy.recovery_strategy import RecoveryStrategy
+from core.models.signal_recalibrator import SignalRecalibrator
 from core.trader.futures_trader import FuturesTrader, _normalize_symbol
 from config.settings import settings, RiskSettings
 from config.logger import get_logger
@@ -58,29 +61,44 @@ async def print_dashboard(exchange, traders: List[FuturesTrader]):
             title=f"AI Trading Bot — {datetime.now().strftime('%H:%M:%S')}",
             box=box.ROUNDED, border_style="cyan",
         )
-        table.add_column("Symbol",    style="bold white")
-        table.add_column("Cycles",    justify="right")
-        table.add_column("ML",        justify="center")
-        table.add_column("Regime",    justify="center")
-        table.add_column("Side",      justify="center")
-        table.add_column("Entry",     justify="right")
-        table.add_column("TP / SL",   justify="center")
-        table.add_column("Bars",      justify="right")
-        table.add_column("PnL",       justify="right")
+        table.add_column("Symbol",   style="bold white")
+        table.add_column("Cycles",   justify="right")
+        table.add_column("ML",       justify="center")
+        table.add_column("Regime",   justify="center")
+        table.add_column("Side",     justify="center")
+        table.add_column("Entry",    justify="right")
+        table.add_column("TP / SL",  justify="center")
+        table.add_column("Bars",     justify="right")
+        table.add_column("WR%",      justify="center")
+        table.add_column("PnL",      justify="right")
 
         for t in traders:
             stats  = t.get_stats()
             pos    = pos_map.get(_normalize_symbol(t.symbol))
             regime = stats.get("regime", "?")
 
+            # Win rate from recalibrator (most active direction)
+            recalib = stats.get("recalib", {})
+            long_wr  = recalib.get("long",  {}).get("win_rate", 0.5)
+            short_wr = recalib.get("short", {}).get("win_rate", 0.5)
+            long_n   = recalib.get("long",  {}).get("trades", 0)
+            short_n  = recalib.get("short", {}).get("trades", 0)
+            if long_n + short_n > 0:
+                wr_str = f"L{long_wr:.0%}/{long_n} S{short_wr:.0%}/{short_n}"
+            else:
+                wr_str = "—"
+
             if pos:
                 side_str  = "[green]LONG[/]"  if pos.side.value == "long" else "[red]SHORT[/]"
                 entry_str = f"{pos.entry_price:.2f}"
                 pnl_val   = pos.unrealized_pnl
-                pnl_str   = f"[green]+{pnl_val:.4f}[/]" if pnl_val >= 0 else f"[red]{pnl_val:.4f}[/]"
+                pnl_str   = (f"[green]+{pnl_val:.4f}[/]" if pnl_val >= 0
+                             else f"[red]{pnl_val:.4f}[/]")
                 tp_sl_str = (f"{stats['tp']:.2f} / {stats['sl']:.2f}"
                              if stats["tp"] else "—")
                 bars_str  = str(stats.get("bars_held", 0))
+                if stats.get("partial_taken"):
+                    bars_str += "*"
             else:
                 side_str  = "[dim]Watching[/]"
                 entry_str = "—"
@@ -97,6 +115,7 @@ async def print_dashboard(exchange, traders: List[FuturesTrader]):
                 entry_str,
                 tp_sl_str,
                 bars_str,
+                wr_str,
                 pnl_str,
             )
 
@@ -124,8 +143,9 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct, interval):
     console.rule("[bold cyan]AI Futures Trading Bot — Starting[/]")
     console.print(f"  Environment : [bold]{settings.environment.upper()}[/]")
     console.print(f"  Pairs       : {', '.join(pairs)}")
-    console.print(f"  Leverage    : {leverage}x  |  TP: {tp_pct}%  |  SL: {sl_pct}%")
-    console.print(f"  Cycle every : {interval}s\n")
+    console.print(f"  Leverage    : {leverage}x  |  Risk/trade: {risk_pct}%")
+    console.print(f"  Timeframe   : 5m candles  |  Cycle: {interval}s")
+    console.print(f"  Candle gate : Active (signal only on new 5m candle)\n")
 
     exchange  = create_exchange("binance")
     connected = await exchange.connect()
@@ -141,8 +161,9 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct, interval):
         max_open_trades=settings.risk.max_open_trades,
         max_daily_loss_pct=settings.risk.max_daily_loss_pct,
     )
-    risk_manager = RiskManager(risk_settings)
-    recovery     = RecoveryStrategy()
+    risk_manager  = RiskManager(risk_settings)
+    recovery      = RecoveryStrategy()
+    recalibrator  = SignalRecalibrator(log_dir=settings.logs_dir)
 
     balance = await exchange.get_balance()
     risk_manager.set_session_balance(balance.total_balance)
@@ -152,6 +173,7 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct, interval):
         trader = FuturesTrader(
             exchange=exchange, symbol=symbol,
             risk_manager=risk_manager, recovery_strategy=recovery,
+            recalibrator=recalibrator,
         )
         _traders.append(trader)
         logger.info(f"Trader ready: {symbol}")
@@ -167,7 +189,6 @@ async def run_bot(pairs, train, leverage, tp_pct, sl_pct, risk_pct, interval):
 
     while _running:
         try:
-            # Advance cooldown timers before running cycles
             risk_manager.tick()
 
             await asyncio.gather(
@@ -198,7 +219,7 @@ def parse_args():
     parser.add_argument("--tp",       type=float, default=settings.risk.take_profit_pct)
     parser.add_argument("--sl",       type=float, default=settings.risk.stop_loss_pct)
     parser.add_argument("--risk",     type=float, default=settings.risk.risk_per_trade_pct)
-    parser.add_argument("--interval", type=int,   default=60)
+    parser.add_argument("--interval", type=int,   default=60)   # 60s cycle, 5m candle
     return parser.parse_args()
 
 

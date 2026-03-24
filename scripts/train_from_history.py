@@ -59,19 +59,19 @@ logger = get_logger("train_history")
 DATA_DIR    = Path(PROJECT_ROOT) / "training_data"
 MODELS_DIR  = Path(PROJECT_ROOT) / "saved_models"
 SYMBOLS     = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
-TIMEFRAMES  = ["15m", "1h", "4h"]
+TIMEFRAMES  = ["5m", "1h"]
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
-FUTURE_BARS    = 8       # 15m bars ahead to label (8 × 15m = 2h horizon)
-ATR_MULT       = 1.5     # barrier width as ATR multiple; tune per symbol below
-ATR_MULT_MAP   = {       # per-symbol ATR multiplier (higher vol = wider barriers)
-    "BTCUSDT": 1.5,
-    "ETHUSDT": 1.8,
-    "BNBUSDT": 1.6,
-    "SOLUSDT": 2.0,
+FUTURE_BARS    = 12      # 5m bars ahead to label (12 × 5m = 1h horizon)
+ATR_MULT       = 1.0     # tighter barrier for 5m noise (was 1.5 for 15m)
+ATR_MULT_MAP   = {
+    "BTCUSDT": 1.0,
+    "ETHUSDT": 1.1,
+    "BNBUSDT": 1.0,
+    "SOLUSDT": 1.2,
 }
-N_WF_SPLITS    = 10      # more folds = more stable WF estimate (restored from 5)
-WF_GAP         = 8       # gap between train/test = FUTURE_BARS (no leakage)
+N_WF_SPLITS    = 5       # 5 folds is enough for 338k bars
+WF_GAP         = 12      # gap = FUTURE_BARS (no leakage)
 
 # Restored strict thresholds — justified now that we have years of data
 MIN_SHARPE     = 0.50
@@ -360,9 +360,9 @@ def train_symbol_from_history(symbol: str, dry_run: bool = False) -> dict:
 
     # ── Load all timeframes ────────────────────────────────────────────────────
     print("  Loading parquet files...")
-    df_15m = load_parquet(symbol, "15m")
+    df_15m = load_parquet(symbol, "5m")   # primary is now 5m
     df_1h  = load_parquet(symbol, "1h")
-    df_4h  = load_parquet(symbol, "4h")
+    df_4h  = None   
 
     if df_15m is None or len(df_15m) < 1000:
         print(f"  [ERROR] 15m data missing or too short ({len(df_15m) if df_15m is not None else 0} bars)")

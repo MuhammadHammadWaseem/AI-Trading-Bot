@@ -26,7 +26,7 @@ class ExchangeCredentials(BaseModel):
 # ─── Risk Settings ────────────────────────────────────────────────────────────
 class RiskSettings(BaseModel):
     leverage: int = Field(default=10, ge=1, le=125)
-    risk_per_trade_pct: float = Field(default=1.0, gt=0, le=10)
+    risk_per_trade_pct: float = Field(default=0.5, gt=0, le=10)   # changed: 1.0 -> 0.5
     take_profit_pct: float = Field(default=2.0, gt=0)
     stop_loss_pct: float = Field(default=1.0, gt=0)
     max_open_trades: int = Field(default=5, ge=1)
@@ -37,7 +37,7 @@ class RiskSettings(BaseModel):
 class ModelSettings(BaseModel):
     retrain_interval_hours: int = 24
     lookback_candles: int = 100
-    confidence_threshold: float = 0.65
+    confidence_threshold: float = 0.70   # was 0.65
     saved_models_dir: Path = BASE_DIR / "saved_models"
 
 
@@ -65,10 +65,10 @@ class Settings(BaseModel):
         "TRADING_PAIRS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT"
     ).split(",")
 
-    # Risk
+    # Risk — default risk_per_trade_pct changed to 0.5
     risk: RiskSettings = RiskSettings(
         leverage=int(os.getenv("DEFAULT_LEVERAGE", 10)),
-        risk_per_trade_pct=float(os.getenv("DEFAULT_RISK_PER_TRADE", 1.0)),
+        risk_per_trade_pct=float(os.getenv("DEFAULT_RISK_PER_TRADE", 0.5)),
         take_profit_pct=float(os.getenv("DEFAULT_TAKE_PROFIT_PCT", 2.0)),
         stop_loss_pct=float(os.getenv("DEFAULT_STOP_LOSS_PCT", 1.0)),
         max_open_trades=int(os.getenv("MAX_OPEN_TRADES", 5)),

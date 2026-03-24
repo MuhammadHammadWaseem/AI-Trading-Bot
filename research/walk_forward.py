@@ -333,44 +333,66 @@ def _compute_classification_metrics(fold: FoldResult) -> FoldResult:
 def _compute_trading_metrics(
     y_pred: np.ndarray,
     prices: np.ndarray,
-    fee_pct: float = 0.0004,   # 0.04% taker fee
-    slippage: float = 0.0002,  # 0.02% slippage
+    fee_pct: float = 0.0004,
+    slippage: float = 0.0002,
+    tp_mult: float = 0.008,   # 0.8% TP — calibrated for 5m (1h horizon)
+    sl_mult: float = 0.004,   # 0.4% SL — half of TP gives 2:1 R:R
+    max_hold_bars: int = 12,  # max 12 bars = 1 hour at 5m
 ) -> dict:
     """
-    Simple PnL simulation from predicted signals and price series.
-    Returns Sharpe, profit factor, win rate, total return, max drawdown.
+    PnL simulation with TP/SL exits and max hold limit.
+    Calibrated for 5m candles (0.8% TP, 0.4% SL, 12-bar max hold).
     """
     returns = []
-    in_position = 0   # +1 long, -1 short, 0 flat
+    in_position = 0
     entry_price = 0.0
+    bars_held = 0
 
     for i in range(len(y_pred) - 1):
         signal = y_pred[i]
         price  = prices[i]
-        next_p = prices[i + 1]
 
-        if in_position == 0 and signal in (1, 2):
-            in_position = 1 if signal == 1 else -1
-            entry_price = price * (1 + slippage * in_position)
+        if in_position == 0:
+            if signal == 1:   # LONG
+                in_position = 1
+                entry_price = price * (1 + slippage)
+                bars_held   = 0
+            elif signal == 2:  # SHORT
+                in_position = -1
+                entry_price = price * (1 - slippage)
+                bars_held   = 0
+        else:
+            bars_held += 1
+            raw_ret = (price - entry_price) / entry_price * in_position
 
-        elif in_position != 0 and signal == 0:
-            exit_price = price * (1 - slippage * in_position)
-            raw_ret    = (exit_price - entry_price) / entry_price * in_position
-            net_ret    = raw_ret - 2 * fee_pct
-            returns.append(net_ret)
-            in_position = 0
+            # TP hit
+            if raw_ret >= tp_mult:
+                net_ret = tp_mult - 2 * fee_pct
+                returns.append(net_ret)
+                in_position = 0
+                continue
 
-        elif in_position != 0 and signal != 0 and (
-            (in_position == 1  and signal == 2) or
-            (in_position == -1 and signal == 1)
-        ):
-            # Flip position
-            exit_price = price * (1 - slippage * in_position)
-            raw_ret    = (exit_price - entry_price) / entry_price * in_position
-            net_ret    = raw_ret - 2 * fee_pct
-            returns.append(net_ret)
-            in_position = 1 if signal == 1 else -1
-            entry_price = price * (1 + slippage * in_position)
+            # SL hit
+            if raw_ret <= -sl_mult:
+                net_ret = -sl_mult - 2 * fee_pct
+                returns.append(net_ret)
+                in_position = 0
+                continue
+
+            # Max hold / signal exit
+            if bars_held >= max_hold_bars or signal == 0:
+                net_ret = raw_ret - 2 * fee_pct
+                returns.append(net_ret)
+                in_position = 0
+                continue
+
+            # Reversal
+            if (in_position == 1 and signal == 2) or (in_position == -1 and signal == 1):
+                net_ret = raw_ret - 2 * fee_pct
+                returns.append(net_ret)
+                in_position = 1 if signal == 1 else -1
+                entry_price = price * (1 + slippage * in_position)
+                bars_held   = 0
 
     if not returns or len(returns) < 3:
         return {"sharpe": 0.0, "profit_factor": 0.0, "win_rate": 0.0,
@@ -381,20 +403,16 @@ def _compute_trading_metrics(
     losses = r[r < 0]
 
     total_return  = float(r.sum())
-    win_rate      = float((r > 0).mean()) if len(r) > 0 else 0.0
+    win_rate      = float((r > 0).mean())
     profit_factor = (float(wins.sum()) / (-float(losses.sum()) + 1e-10)) if len(losses) > 0 else float(wins.sum())
 
-    # Sharpe: guard against near-zero std (degenerate folds with 0% or 100% win rate)
     r_std = float(r.std())
     if r_std < 1e-6 or len(r) < 3:
-        # Degenerate: all trades same outcome — assign directional score instead
         sharpe = float(np.sign(r.mean()) * min(abs(r.mean()) * 10, 3.0))
     else:
         sharpe = float(r.mean() / r_std) * np.sqrt(len(r))
-    # Hard cap: no real strategy has |Sharpe| > 10 on trade-level returns
     sharpe = float(np.clip(sharpe, -10.0, 10.0))
 
-    # Max drawdown on equity curve
     equity = np.cumprod(1.0 + r)
     peak   = np.maximum.accumulate(equity)
     dd     = (equity - peak) / (peak + 1e-10)

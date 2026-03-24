@@ -6,16 +6,11 @@ directional concentration filter, and directional loss-streak guard.
 
 Directional limit:
     MAX_SAME_DIRECTION = 1  — at most 1 LONG and 1 SHORT open at once.
-    This prevents 2×SHORT exposure even when both signals fire AGREE on the
-    same cycle. The second same-direction signal is simply skipped.
 
-Loss-streak guard (new):
-    If the last STREAK_BLOCK_COUNT closed trades in a given direction were
-    ALL losses, block new entries in that direction for STREAK_COOLDOWN_BARS
-    cycles. Prevents the model doubling down on a direction that's clearly
-    wrong for current market conditions.
+Loss-streak guard:
+    3 consecutive losses in a direction → 8-bar cooldown on that direction.
 
-    Default: 3 consecutive losses → 8-bar cooldown on that direction.
+Risk per trade: 0.5% (reduced from 1.0%)
 """
 
 from __future__ import annotations
@@ -55,30 +50,20 @@ class TradeParameters:
 class PortfolioDirectionTracker:
     """
     Enforces directional diversification across all open positions.
-
-    MAX_SAME_DIRECTION = 1 means:
-      • 1 SHORT allowed at any time
-      • 1 LONG allowed at any time
-      • Never 2 SHORTs or 2 LONGs simultaneously
-
-    Also tracks a per-direction loss streak and blocks new entries in a
-    direction after STREAK_BLOCK_COUNT consecutive losses until cooldown clears.
+    MAX_SAME_DIRECTION = 1: never 2 SHORTs or 2 LONGs simultaneously.
+    Tracks per-direction loss streaks and blocks after 3 consecutive losses.
     """
 
-    MAX_SAME_DIRECTION  = 1     # reduced from 2
-    STREAK_BLOCK_COUNT  = 3     # consecutive losses before direction is blocked
-    STREAK_COOLDOWN_BARS = 8    # bars to wait after streak block triggered
+    MAX_SAME_DIRECTION   = 1
+    STREAK_BLOCK_COUNT   = 3
+    STREAK_COOLDOWN_BARS = 8
 
     def __init__(self):
         self._positions: Dict[str, OrderSide] = {}
-
-        # Recent trade outcomes per direction: True=win, False=loss
         self._outcomes: Dict[str, Deque[bool]] = {
             "long":  deque(maxlen=self.STREAK_BLOCK_COUNT),
             "short": deque(maxlen=self.STREAK_BLOCK_COUNT),
         }
-
-        # Cooldown remaining (in bars) per direction
         self._direction_cooldown: Dict[str, int] = {"long": 0, "short": 0}
 
     def tick(self):
@@ -91,17 +76,12 @@ class PortfolioDirectionTracker:
 
     def register_open(self, symbol: str, side: OrderSide):
         self._positions[symbol] = side
-        direction = side.value
         logger.info(
-            f"[PORTFOLIO] {symbol} registered {direction} | "
+            f"[PORTFOLIO] {symbol} registered {side.value} | "
             f"LONG={self._count(OrderSide.LONG)}  SHORT={self._count(OrderSide.SHORT)}"
         )
 
     def register_close(self, symbol: str, profit: bool):
-        """
-        Record a closed trade.
-        profit=True for winners, False for losses (including breakeven-ish timeouts).
-        """
         side = self._positions.pop(symbol, None)
         if side is None:
             return
@@ -109,7 +89,6 @@ class PortfolioDirectionTracker:
         direction = side.value
         self._outcomes[direction].append(profit)
 
-        # Check for loss streak
         outcomes = list(self._outcomes[direction])
         if (
             len(outcomes) >= self.STREAK_BLOCK_COUNT
@@ -128,10 +107,8 @@ class PortfolioDirectionTracker:
         )
 
     def can_open(self, side: OrderSide) -> Tuple[bool, str]:
-        """Return (allowed, reason_if_not)."""
         direction = side.value
 
-        # Check loss-streak cooldown
         cooldown = self._direction_cooldown[direction]
         if cooldown > 0:
             return False, (
@@ -139,7 +116,6 @@ class PortfolioDirectionTracker:
                 f"({cooldown} bars remaining)"
             )
 
-        # Check positional concentration
         current = self._count(side)
         if current >= self.MAX_SAME_DIRECTION:
             return False, (
@@ -166,6 +142,8 @@ class RiskManager:
     TP/SL: ATR-based when atr is provided (preferred), fixed-pct fallback.
         SL = entry ± (ATR × sl_atr_mult)    default 2.0×ATR
         TP = entry ± (ATR × tp_atr_mult)    default 3.0×ATR  → 1.5 R:R
+
+    Risk per trade: 0.5% of available balance (changed from 1.0%)
     """
 
     SL_ATR_MULT = 2.0
@@ -211,7 +189,7 @@ class RiskManager:
         side:        OrderSide,
         entry_price: float,
         balance:     AccountBalance,
-        open_trades: int           = 0,
+        open_trades: int            = 0,
         atr:         Optional[float] = None,
         sl_atr_mult: Optional[float] = None,
         tp_atr_mult: Optional[float] = None,
@@ -223,7 +201,7 @@ class RiskManager:
     ) -> TradeParameters:
 
         lev   = leverage or self.settings.leverage
-        r_pct = risk_pct or self.settings.risk_per_trade_pct
+        r_pct = risk_pct or self.settings.risk_per_trade_pct  # default now 0.5%
 
         # ── Pre-trade checks ──────────────────────────────────────────────
         if open_trades >= self.settings.max_open_trades:
