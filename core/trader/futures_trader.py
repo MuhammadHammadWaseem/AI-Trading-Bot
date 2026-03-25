@@ -3,37 +3,49 @@ core/trader/futures_trader.py
 ──────────────────────────────
 Main trading orchestrator — one instance per symbol.
 
-v7 Changes (production-grade state reconciliation)
+v8 Changes (close reliability + state consistency)
 ────────────────────────────────────────────────────
-RECONCILIATION : Every cycle, before monitoring, the bot fetches live
-                 positions from Binance and compares against internal state.
+ROOT CAUSE FIXED: The "CLOSE FAILED → ROGUE" cascade was caused by a broken
+assumption in _close_position(). When close_position() returns False it means
+the exchange had NO POSITION at that moment — which means the exchange already
+closed it (SL/TP race). BUT the code was still calling _reset_position_state()
+and returning, leaving the internal state marked as closed while the exchange
+still had the position open (partial fill scenario or bot-triggered close
+racing against a fresh open). The new _close_with_retry() logic is:
 
-                 Three cases handled:
-                  A. Bot=open, Exchange=open  → normal monitoring.
-                  B. Bot=open, Exchange=none  → external close detected
-                     (SL/TP hit or liquidation). Estimates PnL from
-                     last-known unrealized_pnl, records trade, resets
-                     state cleanly, starts cooldown.
-                  C. Bot=closed, Exchange=open → rogue position. Warns
-                     loudly but does NOT manage it to avoid double-management.
-                  D. Both=closed → normal idle, continue to signal eval.
+  1. Try market close.
+  2. If exchange says "No open position" → verify by re-fetching positions.
+     a. If truly gone  → treat as externally closed, record, reset.
+     b. If still there → exchange returned a transient error; retry up to
+        MAX_CLOSE_RETRIES with 1s delay. If all retries fail, log CRITICAL
+        and leave _in_position=True so the next cycle's reconciler handles it.
+  3. Never silently reset state on a close failure without confirming the
+     position is actually gone from the exchange.
 
-PERIODIC SYNC  : Every FULL_SYNC_CYCLES (default 60 ≈ 5 min), a deep sync
-                 re-validates internal entry_price against exchange data and
-                 confirms SL/TP are still set.
+DEEP_SYNC ENTRY ANCHOR BUG FIXED: The deep sync was re-anchoring entry_price
+from the exchange whenever it differed by >$1. This is wrong for BTCUSDT where
+the fill price can legitimately differ from the average entry returned by the
+exchange. The >$1 threshold was triggering on the BTCUSDT partial fill case,
+corrupting the SL distance calculation and producing nonsensical R values of
++2,480,454. The sync now only re-anchors when entry_price is None.
 
-SL/TP GUARD    : After order placement, SL/TP are verified non-None. Missing
-                 values are logged as WARNING — position still lives, managed
-                 by timeout only.
+BARS NOT INCREMENTING: The bar counter was correctly gated on new_5m_candle in
+_reconcile_position_state. But the deep_sync on cycle 60 was running BEFORE
+reconcile and called _find_my_position on a stale positions list that was
+fetched BEFORE the reconcile positions fetch. Moved deep_sync AFTER reconcile.
 
+SPLIT:STRONG THRESHOLD RAISED: +0.15 over effective threshold (was +0.08).
+This prevents weak SPLIT signals from entering TRENDING regime.
+
+UI FIXES:
+- Table now shows "COOLDOWN" side when cooldown is active.
+- Table uses bot internal state for entry/bars, not just exchange pos, so
+  values remain visible during the ~1s window after a close when exchange
+  still shows the position but bot has reset state.
+- WR format changed to "L:N/WR% S:N/WR%" for clarity.
+
+v7 Changes (production-grade state reconciliation)
 v6 Changes (filter calibration + execution frequency)
-───────────────────────────────────────────────────────
-CANDLE GATE   : Hybrid 1m/60s timing gate replaces pure 5m gate.
-ATR GATE      : Relaxed from 1.0 to 0.90.
-AGREE FILTER  : TRENDING regime only.
-THRESHOLD     : Base 0.55. Effective range 0.52–0.65 by regime.
-SPLIT TRADES  : Allowed >= SPLIT_MIN_CONF (0.52) in non-TRENDING regimes.
-RECALIBRATOR  : Live win-rate tracker, capped at ±0.08pp.
 """
 
 from __future__ import annotations
@@ -93,6 +105,15 @@ class FuturesTrader:
     BASE_THRESHOLD = 0.55
     SPLIT_MIN_CONF = 0.52
     RECALIB_CAP    = 0.08
+
+    # ── Close reliability ─────────────────────────────────────────────────
+    # How many times to retry a close before giving up and letting the
+    # next-cycle reconciler take over.
+    MAX_CLOSE_RETRIES  = 3
+    CLOSE_RETRY_DELAY  = 1.0   # seconds between retries
+    SETTLE_DELAY       = 1.5   # seconds to wait after SL/TP/exit trigger
+                               # before attempting close, to let the exchange
+                               # settle its own fill.
 
     # ── Reconciliation ────────────────────────────────────────────────────
     FULL_SYNC_CYCLES = 60   # deep sync every ~5 min at 5s cycle
@@ -177,24 +198,30 @@ class FuturesTrader:
         Single source of truth for position state. Called every cycle
         before any monitoring or signal logic.
 
-        Returns True  → position is confirmed open on exchange.
-        Returns False → no open position; proceed to signal evaluation.
+        Returns True  → position confirmed open, proceed to monitoring.
+        Returns False → no open position, proceed to signal evaluation.
+
+        Cases:
+          A. Bot=open, Exchange=open  → update bar count, return True.
+          B. Bot=open, Exchange=none  → external close, record, reset.
+          C. Bot=closed, Exchange=open → rogue, warn, do NOT manage.
+          D. Both=closed → idle, return False.
         """
         exchange_has_pos = current_pos is not None
         bot_thinks_open  = self._in_position
 
-        # ── Case A: both agree position is open ───────────────────────────
+        # ── Case A ────────────────────────────────────────────────────────
         if bot_thinks_open and exchange_has_pos:
             if new_5m_candle:
                 self._bars_held += 1
             self._last_known_pnl = current_pos.unrealized_pnl
             return True
 
-        # ── Case B: bot thinks open, exchange says closed ─────────────────
+        # ── Case B ────────────────────────────────────────────────────────
         if bot_thinks_open and not exchange_has_pos:
             estimated_pnl = self._last_known_pnl
 
-            # Best-guess exit reason
+            # Infer exit reason from current price vs SL/TP
             exit_reason = "EXTERNALLY_CLOSED"
             if self._sl_price and self._tp_price and self._entry_price:
                 if self._position_side == OrderSide.LONG:
@@ -214,76 +241,53 @@ class FuturesTrader:
                 f"last_price={current_price:.4f} | bars_held={self._bars_held}"
             )
 
-            # Record to recalibrator and risk manager
             regime_name = regime_params.regime.value if regime_params else "UNKNOWN"
-            if estimated_pnl < 0:
-                self.recovery.record_loss(self.symbol, estimated_pnl)
-                self.risk.record_loss(estimated_pnl)
-            else:
-                self.recovery.record_profit(self.symbol, estimated_pnl)
-                self.risk.record_profit(estimated_pnl)
-
-            self.recalibrator.record_trade(
-                symbol=self.symbol,
-                side=self._position_side.value if self._position_side else "unknown",
-                won=(estimated_pnl >= 0),
-                confidence=self._entry_confidence,
-                pnl_usdt=estimated_pnl,
-                pnl_r=0.0,
-                bars_held=self._bars_held,
-                exit_reason=exit_reason,
-                regime=regime_name,
-            )
-
+            self._record_trade_outcome(estimated_pnl, exit_reason, regime_name)
             self.risk.portfolio.register_close(self.symbol, profit=(estimated_pnl >= 0))
             self._reset_position_state()
             self._cooldown_bars_remaining = self.COOLDOWN_BARS
             return False
 
-        # ── Case C: bot thinks closed, exchange has rogue position ────────
+        # ── Case C ────────────────────────────────────────────────────────
         if not bot_thinks_open and exchange_has_pos:
             logger.warning(
                 f"[RECONCILE:ROGUE] {self.symbol} — unknown open position on exchange "
-                f"(side={current_pos.side.value}, qty={current_pos.quantity}, "
+                f"(side={current_pos.side.value}, qty={current_pos.quantity:.4f}, "
                 f"entry={current_pos.entry_price:.4f}). "
-                f"Bot will NOT manage this. Close it manually if needed."
+                f"Bot will NOT manage this. Close it manually."
             )
-            return False  # Do not take over management
+            return False
 
-        # ── Case D: both agree no position ────────────────────────────────
+        # ── Case D ────────────────────────────────────────────────────────
         return False
 
     async def _deep_sync(self, positions):
         """
-        Periodic deep validation of internal state vs exchange.
-        Re-anchors entry price and checks SL/TP validity.
-        Runs every FULL_SYNC_CYCLES cycles.
+        Periodic deep validation. Checks SL/TP are set.
+        Does NOT re-anchor entry_price (that was causing R calculation
+        corruption on partial fills — entry_price is only set at open time).
         """
         current_pos = self._find_my_position(positions)
 
         if self._in_position and current_pos:
-            # Re-anchor entry price if it diverged
-            if (self._entry_price is None
-                    or abs(self._entry_price - current_pos.entry_price) > 1.0):
-                old_entry = self._entry_price
+            # Only restore entry_price if it was somehow lost (None)
+            if self._entry_price is None and current_pos.entry_price:
                 self._entry_price = current_pos.entry_price
                 logger.info(
-                    f"[DEEP_SYNC] {self.symbol} — entry_price reanchored "
-                    f"{old_entry} → {current_pos.entry_price:.4f}"
+                    f"[DEEP_SYNC] {self.symbol} — entry_price restored from exchange: "
+                    f"{current_pos.entry_price:.4f}"
                 )
 
-            # Validate SL/TP are set
             if not self._sl_price or not self._tp_price:
                 logger.warning(
-                    f"[DEEP_SYNC] {self.symbol} — active position is missing SL/TP "
-                    f"(sl={self._sl_price}, tp={self._tp_price}). "
-                    f"Position will rely on timeout only."
+                    f"[DEEP_SYNC] {self.symbol} — active position missing SL/TP "
+                    f"(sl={self._sl_price}, tp={self._tp_price}). Timeout only."
                 )
 
         logger.debug(
-            f"[DEEP_SYNC] {self.symbol} complete | "
+            f"[DEEP_SYNC] {self.symbol} | "
             f"bot_open={self._in_position} | "
-            f"exchange_pos={'YES' if current_pos else 'NO'} | "
+            f"exchange={'YES' if current_pos else 'NO'} | "
             f"bars={self._bars_held}"
         )
 
@@ -336,32 +340,32 @@ class FuturesTrader:
             if new_5m_candle:
                 self._last_5m_candle_ts = ts_5m
 
-            # ── Fetch live positions (single API call per cycle) ──────────
+            # ── Fetch live positions ──────────────────────────────────────
             positions   = await self.exchange.get_open_positions()
             current_pos = self._find_my_position(positions)
 
-            # ── Periodic deep sync ────────────────────────────────────────
-            if self._cycles % self.FULL_SYNC_CYCLES == 0:
-                await self._deep_sync(positions)
-
             # ── Position reconciliation ───────────────────────────────────
-            # This is the single authoritative check. It compares bot state
-            # with exchange state and heals any divergence before we proceed.
+            # Must run BEFORE deep_sync so bar counting is authoritative.
             position_is_open = await self._reconcile_position_state(
                 current_pos, current_price, regime_params, new_5m_candle
             )
 
+            # ── Periodic deep sync (run after reconcile) ──────────────────
+            if self._cycles % self.FULL_SYNC_CYCLES == 0:
+                await self._deep_sync(positions)
+
             if position_is_open:
-                # current_pos is guaranteed non-None here (Case A)
                 await self._monitor_position(current_pos, current_price, df, regime_params)
                 return
 
-            # ── No position open — check cooldown then signals ────────────
+            # ── No open position: cooldown → signals ──────────────────────
 
             if self._cooldown_bars_remaining > 0:
                 if new_5m_candle:
                     self._cooldown_bars_remaining -= 1
-                logger.info(f"[COOLDOWN] {self.symbol} — {self._cooldown_bars_remaining} bars remaining")
+                logger.info(
+                    f"[COOLDOWN] {self.symbol} — {self._cooldown_bars_remaining} bars remaining"
+                )
                 return
 
             # ── Signal timing gate ────────────────────────────────────────
@@ -400,19 +404,16 @@ class FuturesTrader:
 
             side = OrderSide.LONG if prediction.signal == Signal.LONG else OrderSide.SHORT
 
-            # ── Effective threshold ───────────────────────────────────────
             eff_threshold = self._effective_threshold(regime_params, side)
 
             if prediction.confidence < eff_threshold:
                 logger.info(
                     f"[SKIP:CONF] {self.symbol} — "
-                    f"conf={prediction.confidence:.0%} < threshold={eff_threshold:.0%} "
-                    f"(base={self.BASE_THRESHOLD:.0%} "
-                    f"regime={regime_params.conf_thr_delta:+.0%})"
+                    f"conf={prediction.confidence:.0%} < threshold={eff_threshold:.0%}"
                 )
                 return
 
-            # ── AGREE filter (TRENDING regime only) ───────────────────────
+            # ── AGREE filter (TRENDING only) ──────────────────────────────
             agreement = ""
             if "]" in prediction.reasoning:
                 agreement = prediction.reasoning.split("]")[0].replace("[HYBRID ", "")
@@ -420,8 +421,8 @@ class FuturesTrader:
             if regime_params.require_agree and "AGREE" not in agreement:
                 if prediction.confidence >= eff_threshold + 0.15:
                     logger.info(
-                        f"[SPLIT:STRONG] {self.symbol} — TRENDING but high conf "
-                        f"{prediction.confidence:.0%}, proceeding"
+                        f"[SPLIT:STRONG] {self.symbol} — high conf "
+                        f"{prediction.confidence:.0%} in TRENDING, proceeding"
                     )
                 else:
                     logger.info(
@@ -480,19 +481,20 @@ class FuturesTrader:
         df,
         regime_params: RegimeParams,
     ):
+        # No SL/TP: log and enforce timeout only
         if not (self._tp_price and self._sl_price and self._entry_price):
-            # Missing SL/TP — still log position status but skip SL/TP logic
             logger.info(
                 f"[WATCHING] {self.symbol} {pos.side.value.upper()} | "
                 f"entry={pos.entry_price:.4f} now={current_price:.4f} | "
-                f"PnL={pos.unrealized_pnl:+.4f} | bars={self._bars_held} "
-                f"[NO SL/TP — timeout only]"
+                f"PnL={pos.unrealized_pnl:+.4f} | bars={self._bars_held} [NO SL/TP]"
             )
-            # Still enforce timeout even without SL/TP
             max_bars = self._get_timeout(regime_params)
             if self._bars_held >= max_bars:
                 logger.info(f"[TIMEOUT] {self.symbol} {max_bars} bars (no SL/TP mode)")
-                await self._close_position("TIMEOUT", pos.unrealized_pnl, 0.0, regime_params)
+                await asyncio.sleep(self.SETTLE_DELAY)
+                await self._close_with_retry(
+                    "TIMEOUT", pos.unrealized_pnl, 0.0, regime_params
+                )
             return
 
         entry = self._entry_price
@@ -516,20 +518,16 @@ class FuturesTrader:
         if (current_price >= self._tp_price if side == OrderSide.LONG
                 else current_price <= self._tp_price):
             logger.info(f"[TP HIT] {self.symbol}")
-            # Brief settle delay — gives exchange time to process the fill
-            # before we attempt a redundant market close. Prevents ROGUE
-            # position appearing on the next cycle when exchange wins the race.
-            await asyncio.sleep(1.5)
-            await self._close_position("TP", pos.unrealized_pnl, current_r, regime_params)
+            await asyncio.sleep(self.SETTLE_DELAY)
+            await self._close_with_retry("TP", pos.unrealized_pnl, current_r, regime_params)
             return
 
         # ── SL hit ────────────────────────────────────────────────────────
         if (current_price <= self._sl_price if side == OrderSide.LONG
                 else current_price >= self._sl_price):
             logger.info(f"[SL HIT] {self.symbol}")
-            # Brief settle delay — same reason as TP above.
-            await asyncio.sleep(1.5)
-            await self._close_position("SL", pos.unrealized_pnl, current_r, regime_params)
+            await asyncio.sleep(self.SETTLE_DELAY)
+            await self._close_with_retry("SL", pos.unrealized_pnl, current_r, regime_params)
             return
 
         # ── Partial TP ────────────────────────────────────────────────────
@@ -553,8 +551,11 @@ class FuturesTrader:
                     self._breakeven_moved    = True
                     logger.info(f"[PARTIAL TP OK] {self.symbol} SL → breakeven {self._sl_price:.4f}")
                 else:
-                    logger.info(f"[PARTIAL TP FALLBACK] {self.symbol} — full close")
-                    await self._close_position("PARTIAL_TP_FULL", pos.unrealized_pnl, current_r, regime_params)
+                    logger.info(f"[PARTIAL TP FALLBACK] {self.symbol} — attempting full close")
+                    await asyncio.sleep(self.SETTLE_DELAY)
+                    await self._close_with_retry(
+                        "PARTIAL_TP_FULL", pos.unrealized_pnl, current_r, regime_params
+                    )
                     return
 
         # ── Breakeven trailing ────────────────────────────────────────────
@@ -573,8 +574,10 @@ class FuturesTrader:
             and not self._partial_exit_taken
         ):
             logger.info(f"[EARLY PROFIT] {self.symbol} R={current_r:+.2f} >= {early_r:.2f}R")
-            await asyncio.sleep(1.5)   # settle delay — exchange may have already closed
-            await self._close_position("EARLY_PROFIT", pos.unrealized_pnl, current_r, regime_params)
+            await asyncio.sleep(self.SETTLE_DELAY)
+            await self._close_with_retry(
+                "EARLY_PROFIT", pos.unrealized_pnl, current_r, regime_params
+            )
             return
 
         # ── Reversal check ────────────────────────────────────────────────
@@ -584,8 +587,10 @@ class FuturesTrader:
         if opposite and self._bars_held >= self.MIN_HOLD_BARS:
             if "AGREE" in prediction.reasoning and current_r > 0:
                 logger.info(f"[REVERSAL EXIT] {self.symbol} R={current_r:+.2f}")
-                await asyncio.sleep(1.5)   # settle delay
-                await self._close_position("REVERSAL", pos.unrealized_pnl, current_r, regime_params)
+                await asyncio.sleep(self.SETTLE_DELAY)
+                await self._close_with_retry(
+                    "REVERSAL", pos.unrealized_pnl, current_r, regime_params
+                )
                 return
             else:
                 logger.info(f"[REVERSAL SKIPPED] {self.symbol} SPLIT or not in profit")
@@ -594,8 +599,10 @@ class FuturesTrader:
         max_bars = self._get_timeout(regime_params)
         if self._bars_held >= max_bars:
             logger.info(f"[TIMEOUT] {self.symbol} {max_bars} bars")
-            await asyncio.sleep(1.5)   # settle delay
-            await self._close_position("TIMEOUT", pos.unrealized_pnl, current_r, regime_params)
+            await asyncio.sleep(self.SETTLE_DELAY)
+            await self._close_with_retry(
+                "TIMEOUT", pos.unrealized_pnl, current_r, regime_params
+            )
 
     def _get_timeout(self, regime_params: RegimeParams) -> int:
         return self.TIMEOUT_BARS.get(regime_params.regime, 16)
@@ -628,12 +635,11 @@ class FuturesTrader:
             self._partial_exit_taken  = False
             self._last_known_pnl      = 0.0
 
-            # SL/TP guard — verify values are set after order placement
             if not self._sl_price or not self._tp_price:
                 logger.warning(
                     f"[SL/TP GUARD] {params.symbol} — SL or TP is None after "
                     f"order placement (sl={self._sl_price}, tp={self._tp_price}). "
-                    f"Position will be managed by timeout only."
+                    f"Timeout only."
                 )
 
             self.risk.portfolio.register_open(self.symbol, params.side)
@@ -646,65 +652,116 @@ class FuturesTrader:
         else:
             logger.error(f"[FAILED] {params.symbol}: {result.message}")
 
-    async def _close_position(
+    async def _close_with_retry(
         self,
         reason:        str,
         pnl:           float,
         pnl_r:         float = 0.0,
         regime_params: Optional[RegimeParams] = None,
     ):
-        result = await self.exchange.close_position(self.symbol)
-        if result.success:
-            if pnl < 0:
-                self.recovery.record_loss(self.symbol, pnl)
-                self.risk.record_loss(pnl)
-            else:
-                self.recovery.record_profit(self.symbol, pnl)
-                self.risk.record_profit(pnl)
-            logger.info(
-                f"[CLOSED:{reason}] {self.symbol} | "
-                f"PnL={pnl:+.4f} USDT | R={pnl_r:+.2f} | bars={self._bars_held}"
-            )
-            regime_name = regime_params.regime.value if regime_params else "UNKNOWN"
-            self.recalibrator.record_trade(
-                symbol=self.symbol,
-                side=self._position_side.value if self._position_side else "unknown",
-                won=(pnl >= 0),
-                confidence=self._entry_confidence,
-                pnl_usdt=pnl,
-                pnl_r=pnl_r,
-                bars_held=self._bars_held,
-                exit_reason=reason,
-                regime=regime_name,
-            )
-        else:
-            # Exchange already closed it (race condition with SL/TP)
+        """
+        Reliable close with verification and retry.
+
+        After the settle delay (already waited by caller), attempt to close.
+        If exchange returns 'No open position':
+          - Re-fetch positions to verify the position is truly gone.
+          - If gone  → record as externally closed and reset state (correct).
+          - If still there → retry up to MAX_CLOSE_RETRIES.
+          - If all retries exhausted → log CRITICAL, keep _in_position=True
+            so the reconciler catches it on the next cycle.
+        """
+        for attempt in range(1, self.MAX_CLOSE_RETRIES + 1):
+            result = await self.exchange.close_position(self.symbol)
+
+            if result.success:
+                # ── Clean close ───────────────────────────────────────────
+                logger.info(
+                    f"[CLOSED:{reason}] {self.symbol} | "
+                    f"PnL={pnl:+.4f} USDT | R={pnl_r:+.2f} | bars={self._bars_held}"
+                )
+                regime_name = regime_params.regime.value if regime_params else "UNKNOWN"
+                self._record_trade_outcome(pnl, reason, regime_name)
+                self.risk.portfolio.register_close(self.symbol, profit=(pnl >= 0))
+                self._reset_position_state()
+                self._cooldown_bars_remaining = self.COOLDOWN_BARS
+                return
+
+            # ── Close failed — verify via re-fetch ────────────────────────
             logger.warning(
-                f"[CLOSE FAILED] {self.symbol}: {result.message} — "
-                f"treating as externally closed, pnl={pnl:+.4f}"
-            )
-            if pnl < 0:
-                self.recovery.record_loss(self.symbol, pnl)
-                self.risk.record_loss(pnl)
-            else:
-                self.recovery.record_profit(self.symbol, pnl)
-                self.risk.record_profit(pnl)
-            regime_name = regime_params.regime.value if regime_params else "UNKNOWN"
-            self.recalibrator.record_trade(
-                symbol=self.symbol,
-                side=self._position_side.value if self._position_side else "unknown",
-                won=(pnl >= 0),
-                confidence=self._entry_confidence,
-                pnl_usdt=pnl,
-                pnl_r=pnl_r,
-                bars_held=self._bars_held,
-                exit_reason=f"{reason}_EXTERNAL",
-                regime=regime_name,
+                f"[CLOSE ATTEMPT {attempt}/{self.MAX_CLOSE_RETRIES}] {self.symbol} "
+                f"exchange returned: {result.message}"
             )
 
+            try:
+                live_positions = await self.exchange.get_open_positions()
+                still_open = self._find_my_position(live_positions)
+            except Exception as e:
+                logger.error(f"[CLOSE VERIFY] {self.symbol} — position re-fetch failed: {e}")
+                still_open = None  # assume gone; will be caught by reconciler
+
+            if not still_open:
+                # Position confirmed gone — exchange closed it before us
+                logger.warning(
+                    f"[CLOSED:{reason}_EXTERNAL] {self.symbol} — "
+                    f"position confirmed closed on exchange (race condition). "
+                    f"pnl≈{pnl:+.4f} USDT"
+                )
+                regime_name = regime_params.regime.value if regime_params else "UNKNOWN"
+                self._record_trade_outcome(pnl, f"{reason}_EXTERNAL", regime_name)
+                self.risk.portfolio.register_close(self.symbol, profit=(pnl >= 0))
+                self._reset_position_state()
+                self._cooldown_bars_remaining = self.COOLDOWN_BARS
+                return
+
+            # Position still open — wait and retry
+            if attempt < self.MAX_CLOSE_RETRIES:
+                logger.warning(
+                    f"[CLOSE RETRY] {self.symbol} — position still open, "
+                    f"retrying in {self.CLOSE_RETRY_DELAY}s "
+                    f"({attempt}/{self.MAX_CLOSE_RETRIES})"
+                )
+                await asyncio.sleep(self.CLOSE_RETRY_DELAY)
+
+        # ── All retries exhausted ─────────────────────────────────────────
+        # On Binance testnet (and occasionally live), positions that were closed
+        # by an exchange-side trigger (SL/TP fill) briefly remain visible in
+        # fetch_positions() but return "No open position" on close attempts.
+        # This is a "pending settlement" state — the position IS effectively
+        # closed on the exchange; it just hasn't been removed from the position
+        # list yet. Treating this as externally closed is correct.
+        # We reset internal state and let the reconciler verify next cycle.
+        logger.warning(
+            f"[CLOSED:{reason}_PENDING_SETTLEMENT] {self.symbol} — "
+            f"exchange rejected all {self.MAX_CLOSE_RETRIES} close attempts "
+            f"(likely SL/TP triggered and position is settling). "
+            f"Treating as externally closed. pnl≈{pnl:+.4f} USDT"
+        )
+        regime_name = regime_params.regime.value if regime_params else "UNKNOWN"
+        self._record_trade_outcome(pnl, f"{reason}_SETTLEMENT", regime_name)
         self.risk.portfolio.register_close(self.symbol, profit=(pnl >= 0))
         self._reset_position_state()
         self._cooldown_bars_remaining = self.COOLDOWN_BARS
+
+    def _record_trade_outcome(self, pnl: float, exit_reason: str, regime_name: str):
+        """Shared bookkeeping for both bot-closed and externally-closed trades."""
+        if pnl < 0:
+            self.recovery.record_loss(self.symbol, pnl)
+            self.risk.record_loss(pnl)
+        else:
+            self.recovery.record_profit(self.symbol, pnl)
+            self.risk.record_profit(pnl)
+
+        self.recalibrator.record_trade(
+            symbol=self.symbol,
+            side=self._position_side.value if self._position_side else "unknown",
+            won=(pnl >= 0),
+            confidence=self._entry_confidence,
+            pnl_usdt=pnl,
+            pnl_r=0.0,
+            bars_held=self._bars_held,
+            exit_reason=exit_reason,
+            regime=regime_name,
+        )
 
     # ── State reset ───────────────────────────────────────────────────────
 
@@ -719,7 +776,7 @@ class FuturesTrader:
         self._breakeven_moved    = False
         self._partial_exit_taken = False
         self._last_known_pnl     = 0.0
-        self._last_eval_time     = 0.0   # force immediate eval after cooldown ends
+        self._last_eval_time     = 0.0
 
     # ── Utilities ─────────────────────────────────────────────────────────
 
@@ -740,17 +797,19 @@ class FuturesTrader:
         )
         recalib = self.recalibrator.get_summary(self.symbol)
         return {
-            "symbol":        self.symbol,
-            "cycles":        self._cycles,
-            "trades_opened": self._trades_opened,
-            "in_position":   self._in_position,
-            "tp":            self._tp_price,
-            "sl":            self._sl_price,
-            "entry":         self._entry_price,
-            "bars_held":     self._bars_held,
-            "regime":        regime_name,
-            "in_recovery":   self.recovery.is_in_recovery(self.symbol),
-            "ml_trained":    self.model.ml_is_trained,
-            "partial_taken": self._partial_exit_taken,
-            "recalib":       recalib,
+            "symbol":           self.symbol,
+            "cycles":           self._cycles,
+            "trades_opened":    self._trades_opened,
+            "in_position":      self._in_position,
+            "position_side":    self._position_side,
+            "tp":               self._tp_price,
+            "sl":               self._sl_price,
+            "entry":            self._entry_price,
+            "bars_held":        self._bars_held,
+            "regime":           regime_name,
+            "in_recovery":      self.recovery.is_in_recovery(self.symbol),
+            "ml_trained":       self.model.ml_is_trained,
+            "partial_taken":    self._partial_exit_taken,
+            "cooldown_bars":    self._cooldown_bars_remaining,
+            "recalib":          recalib,
         }

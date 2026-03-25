@@ -18,6 +18,11 @@ from config.settings import ExchangeCredentials
 logger = get_logger(__name__)
 
 
+def _normalize_symbol(symbol: str) -> str:
+    """Normalize ccxt symbol formats to plain uppercase e.g. ETH/USDT:USDT → ETHUSDT."""
+    return symbol.replace("/", "").replace(":USDT", "").replace(":BTC", "").upper()
+
+
 class BinanceExchange(BaseExchange):
 
     TESTNET_BASE = "https://testnet.binancefuture.com"
@@ -166,7 +171,10 @@ class BinanceExchange(BaseExchange):
         """Close a partial quantity of an open position (reduceOnly)."""
         try:
             positions = await self.get_open_positions()
-            pos = next((p for p in positions if p.symbol == symbol), None)
+            my_sym = _normalize_symbol(symbol)
+            pos = next(
+                (p for p in positions if _normalize_symbol(p.symbol) == my_sym), None
+            )
             if not pos:
                 return OrderResult(
                     success=False, order_id="", symbol=symbol,
@@ -197,7 +205,10 @@ class BinanceExchange(BaseExchange):
     async def close_position(self, symbol, order_id=None) -> OrderResult:
         try:
             positions = await self.get_open_positions()
-            pos = next((p for p in positions if p.symbol == symbol), None)
+            my_sym = _normalize_symbol(symbol)
+            pos = next(
+                (p for p in positions if _normalize_symbol(p.symbol) == my_sym), None
+            )
             if not pos:
                 return OrderResult(
                     success=False, order_id="", symbol=symbol,

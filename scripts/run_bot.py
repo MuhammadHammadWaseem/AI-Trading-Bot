@@ -83,31 +83,50 @@ async def print_dashboard(exchange, traders: List[FuturesTrader]):
             pos    = pos_map.get(_normalize_symbol(t.symbol))
             regime = stats.get("regime", "?")
 
+            # WR format: "L:N/WR%  S:N/WR%"
             recalib  = stats.get("recalib", {})
-            long_wr  = recalib.get("long",  {}).get("win_rate", 0.5)
-            short_wr = recalib.get("short", {}).get("win_rate", 0.5)
+            long_wr  = recalib.get("long",  {}).get("win_rate", 0.0)
+            short_wr = recalib.get("short", {}).get("win_rate", 0.0)
             long_n   = recalib.get("long",  {}).get("trades", 0)
             short_n  = recalib.get("short", {}).get("trades", 0)
-            wr_str   = f"L{long_wr:.0%}/{long_n} S{short_wr:.0%}/{short_n}" \
-                       if long_n + short_n > 0 else "—"
+            if long_n + short_n > 0:
+                parts = []
+                if long_n  > 0: parts.append(f"L:{long_n}/{long_wr:.0%}")
+                if short_n > 0: parts.append(f"S:{short_n}/{short_wr:.0%}")
+                wr_str = "  ".join(parts)
+            else:
+                wr_str = "—"
 
-            if pos:
-                side_str  = "[green]LONG[/]"  if pos.side.value == "long" else "[red]SHORT[/]"
-                entry_str = f"{pos.entry_price:.2f}"
-                pnl_val   = pos.unrealized_pnl
-                pnl_str   = (f"[green]+{pnl_val:.4f}[/]" if pnl_val >= 0
-                             else f"[red]{pnl_val:.4f}[/]")
+            # Use bot internal state as authoritative source.
+            # Exchange pos used only for live PnL (most accurate).
+            bot_in_pos = stats.get("in_position", False)
+            cooldown   = stats.get("cooldown_bars", 0)
+            bot_side   = stats.get("position_side")  # OrderSide or None
+
+            if bot_in_pos and stats.get("entry"):
+                if bot_side and bot_side.value == "long":
+                    side_str = "[green]LONG[/]"
+                elif bot_side and bot_side.value == "short":
+                    side_str = "[red]SHORT[/]"
+                else:
+                    side_str = "[yellow]OPEN[/]"
+                entry_str = f"{stats['entry']:.2f}"
                 tp_sl_str = (f"{stats['tp']:.2f} / {stats['sl']:.2f}"
-                             if stats["tp"] else "—")
+                             if stats["tp"] and stats["sl"] else "—")
                 bars_str  = str(stats.get("bars_held", 0))
-                if stats.get("partial_taken"):
-                    bars_str += "*"
+                if stats.get("partial_taken"): bars_str += "*"
+                if pos:
+                    pnl_val = pos.unrealized_pnl
+                    pnl_str = (f"[green]+{pnl_val:.4f}[/]" if pnl_val >= 0
+                               else f"[red]{pnl_val:.4f}[/]")
+                else:
+                    pnl_str = "[dim]...[/]"
+            elif cooldown > 0:
+                side_str  = f"[yellow]COOLDOWN {cooldown}[/]"
+                entry_str = tp_sl_str = bars_str = pnl_str = "—"
             else:
                 side_str  = "[dim]Watching[/]"
-                entry_str = "—"
-                pnl_str   = "—"
-                tp_sl_str = "—"
-                bars_str  = "—"
+                entry_str = tp_sl_str = bars_str = pnl_str = "—"
 
             table.add_row(
                 stats["symbol"],
