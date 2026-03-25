@@ -418,7 +418,7 @@ class FuturesTrader:
                 agreement = prediction.reasoning.split("]")[0].replace("[HYBRID ", "")
 
             if regime_params.require_agree and "AGREE" not in agreement:
-                if prediction.confidence >= eff_threshold + 0.08:
+                if prediction.confidence >= eff_threshold + 0.15:
                     logger.info(
                         f"[SPLIT:STRONG] {self.symbol} — TRENDING but high conf "
                         f"{prediction.confidence:.0%}, proceeding"
@@ -516,6 +516,10 @@ class FuturesTrader:
         if (current_price >= self._tp_price if side == OrderSide.LONG
                 else current_price <= self._tp_price):
             logger.info(f"[TP HIT] {self.symbol}")
+            # Brief settle delay — gives exchange time to process the fill
+            # before we attempt a redundant market close. Prevents ROGUE
+            # position appearing on the next cycle when exchange wins the race.
+            await asyncio.sleep(1.5)
             await self._close_position("TP", pos.unrealized_pnl, current_r, regime_params)
             return
 
@@ -523,6 +527,8 @@ class FuturesTrader:
         if (current_price <= self._sl_price if side == OrderSide.LONG
                 else current_price >= self._sl_price):
             logger.info(f"[SL HIT] {self.symbol}")
+            # Brief settle delay — same reason as TP above.
+            await asyncio.sleep(1.5)
             await self._close_position("SL", pos.unrealized_pnl, current_r, regime_params)
             return
 
@@ -567,6 +573,7 @@ class FuturesTrader:
             and not self._partial_exit_taken
         ):
             logger.info(f"[EARLY PROFIT] {self.symbol} R={current_r:+.2f} >= {early_r:.2f}R")
+            await asyncio.sleep(1.5)   # settle delay — exchange may have already closed
             await self._close_position("EARLY_PROFIT", pos.unrealized_pnl, current_r, regime_params)
             return
 
@@ -577,6 +584,7 @@ class FuturesTrader:
         if opposite and self._bars_held >= self.MIN_HOLD_BARS:
             if "AGREE" in prediction.reasoning and current_r > 0:
                 logger.info(f"[REVERSAL EXIT] {self.symbol} R={current_r:+.2f}")
+                await asyncio.sleep(1.5)   # settle delay
                 await self._close_position("REVERSAL", pos.unrealized_pnl, current_r, regime_params)
                 return
             else:
@@ -586,6 +594,7 @@ class FuturesTrader:
         max_bars = self._get_timeout(regime_params)
         if self._bars_held >= max_bars:
             logger.info(f"[TIMEOUT] {self.symbol} {max_bars} bars")
+            await asyncio.sleep(1.5)   # settle delay
             await self._close_position("TIMEOUT", pos.unrealized_pnl, current_r, regime_params)
 
     def _get_timeout(self, regime_params: RegimeParams) -> int:
