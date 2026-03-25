@@ -29,6 +29,7 @@ class RecoveryState:
     recovery_attempts:   int   = 0
     last_loss_time:      Optional[datetime] = None
     is_recovering:       bool  = False
+    wait_bars:           int   = 0   # 5m bars elapsed without a qualifying recovery signal
 
 
 class RecoveryStrategy:
@@ -46,9 +47,34 @@ class RecoveryStrategy:
     RECOVERY_CONFIDENCE_MIN = 0.70
     SIZE_MULTIPLIER_PER_TRY = 1.5    # 1x → 1.5x → 2.25x
     COOLDOWN_MINUTES        = 60
+    MAX_RECOVERY_WAIT_BARS  = 6      # ~30 min at 5m TF — auto-clear if no qualifying signal
 
     def __init__(self):
         self._states: Dict[str, RecoveryState] = {}
+
+    def tick_bar(self, symbol: str):
+        """
+        Call once per new 5m candle for a symbol in recovery.
+        After MAX_RECOVERY_WAIT_BARS bars without a qualifying signal,
+        auto-clears recovery so normal trading resumes at standard size.
+        """
+        if symbol not in self._states:
+            return
+        state = self._states[symbol]
+        if not state.is_recovering:
+            return
+
+        state.wait_bars += 1
+        if state.wait_bars >= self.MAX_RECOVERY_WAIT_BARS:
+            state.is_recovering     = False
+            state.recovery_attempts = 0
+            state.wait_bars         = 0
+            logger.info(
+                f"[RECOVERY AUTO-CLEAR] {symbol} — no qualifying signal for "
+                f"{self.MAX_RECOVERY_WAIT_BARS} bars. "
+                f"Resuming normal trading (loss={state.total_loss_usdt:.2f} USDT written off)."
+            )
+            state.total_loss_usdt = 0.0
 
     def record_loss(self, symbol: str, loss_usdt: float):
         """Call this when a trade closes at a loss."""
@@ -60,6 +86,7 @@ class RecoveryStrategy:
         state.is_recovering      = True
         state.last_loss_time     = datetime.now()
         state.recovery_attempts  = 0
+        state.wait_bars          = 0
 
         logger.warning(
             f"📉 Loss recorded: {symbol} | "
@@ -159,4 +186,4 @@ class RecoveryStrategy:
         )
 
     def get_state(self, symbol: str) -> Optional[RecoveryState]:
-        return self._states.get(symbol)
+        return self._states.get(symbol) 

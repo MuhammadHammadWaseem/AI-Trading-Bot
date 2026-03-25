@@ -339,6 +339,9 @@ class FuturesTrader:
             new_5m_candle = (ts_5m != self._last_5m_candle_ts)
             if new_5m_candle:
                 self._last_5m_candle_ts = ts_5m
+                # Tick recovery wait-bar counter so auto-clear can fire
+                if self.recovery.is_in_recovery(self.symbol):
+                    self.recovery.tick_bar(self.symbol)
 
             # ── Fetch live positions ──────────────────────────────────────
             positions   = await self.exchange.get_open_positions()
@@ -462,6 +465,9 @@ class FuturesTrader:
                     mult = self.recovery.get_recovery_size_multiplier(self.symbol)
                     trade_params.quantity = round(trade_params.quantity * mult, 3)
                     logger.info(f"[RECOVERY] {self.symbol} size x{mult:.1f}")
+                    # Reset wait counter — a qualifying signal fired
+                    if self.symbol in self.recovery._states:
+                        self.recovery._states[self.symbol].wait_bars = 0
                 else:
                     logger.info(f"[RECOVERY WAIT] {self.symbol}")
                     return
