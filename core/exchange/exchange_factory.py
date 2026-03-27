@@ -44,3 +44,23 @@ def create_exchange(
 
     exchange_class = EXCHANGE_MAP[exchange_name]
     return exchange_class(credentials)
+
+
+async def create_exchange_from_config(
+    exchange_name: str,
+    api_key:       str,
+    api_secret:    str,
+    testnet:       bool = True,
+) -> BaseExchange:
+    """
+    Create an exchange using credentials supplied at runtime (from Laravel config).
+    This is used by run_bot_managed.py where credentials come from the JSON config
+    written by Laravel rather than from .env settings.
+    """
+    from config.settings import ExchangeCredentials
+    creds = ExchangeCredentials(
+        api_key = api_key,
+        secret  = api_secret,
+        testnet = testnet,
+    )
+    return create_exchange(exchange_name=exchange_name, credentials=creds)

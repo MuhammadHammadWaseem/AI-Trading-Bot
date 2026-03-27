@@ -86,11 +86,14 @@ class FuturesTrader:
 
     # ── Position monitoring ────────────────────────────────────────────────
     TIMEOUT_BARS: dict = {
-        Regime.TRENDING:  24,
-        Regime.RANGING:   12,
-        Regime.HIGH_VOL:   8,
+        Regime.TRENDING:  10,   # 10 × 5m = 50 min
+        Regime.RANGING:    8,   #  8 × 5m = 40 min
+        Regime.HIGH_VOL:   6,   #  6 × 5m = 30 min
     }
     COOLDOWN_BARS = 3
+
+    # Hard wall-clock cap — no trade stays open longer than this, ever.
+    MAX_TRADE_DURATION_MINUTES: int = 60
 
     # ── Partial TP / trailing ─────────────────────────────────────────────
     BREAKEVEN_TRIGGER_R  = 1.0
@@ -118,21 +121,69 @@ class FuturesTrader:
     # ── Reconciliation ────────────────────────────────────────────────────
     FULL_SYNC_CYCLES = 60   # deep sync every ~5 min at 5s cycle
 
-    def __init__(self, exchange, symbol, risk_manager, recovery_strategy,
-                 recalibrator: Optional[SignalRecalibrator] = None):
+    def __init__(
+        self,
+        exchange,
+        symbol:            str,
+        risk_manager=None,
+        recovery_strategy=None,
+        recalibrator:      Optional[SignalRecalibrator] = None,
+        reporter=None,
+        stop_event=None,
+        # Overridable settings (used by run_bot_managed.py)
+        leverage:              int   = None,
+        risk_per_trade:        float = None,
+        daily_loss_limit:      float = None,
+        daily_profit_target:   float = None,
+        base_threshold:        float = None,
+        timeframe:             str   = None,
+        **kwargs,
+    ):
         self.exchange     = exchange
         self.symbol       = symbol
-        self.risk         = risk_manager
-        self.recovery     = recovery_strategy
         self.model        = HybridModel(symbol=symbol)
         self.regime       = RegimeDetector(symbol=symbol)
         self.recalibrator = recalibrator or SignalRecalibrator()
 
+        # ── Auto-instantiate when not provided (managed mode) ─────────────
+        self.recovery = recovery_strategy or RecoveryStrategy()
+
+        if risk_manager is None:
+            from core.risk.risk_manager import RiskSettings
+            rs = RiskSettings(
+                leverage=leverage or settings.risk.leverage,
+                take_profit_pct=settings.risk.take_profit_pct,
+                stop_loss_pct=settings.risk.stop_loss_pct,
+                risk_per_trade_pct=risk_per_trade or settings.risk.risk_per_trade_pct,
+                max_open_trades=settings.risk.max_open_trades,
+                max_daily_loss_pct=settings.risk.max_daily_loss_pct,
+                max_daily_loss_usdt=daily_loss_limit or 0.0,
+            )
+            risk_manager = RiskManager(rs)
+        self.risk = risk_manager
+
+        # Override class-level constants if provided
+        if base_threshold is not None:
+            self.BASE_THRESHOLD = base_threshold / 100.0 if base_threshold > 1 else base_threshold
+        if timeframe is not None:
+            self.TIMEFRAME = timeframe
+
+        # Reporter + stop event (Laravel integration)
+        self._reporter   = reporter
+        self._stop_event = stop_event
+        self._trade_ids: dict = {}   # symbol → Laravel trade_id
+
+        # Signal metadata for reporting
+        self._last_signal_type = None
+        self._last_regime      = None
+
+        # ── Bot lifecycle ──────────────────────────────────────────────────
         self._is_active     = True
         self._cycles        = 0
         self._trades_opened = 0
+        self._position_opened_at: Optional[float] = None   # monotonic time
 
-        # Position state
+        # ── Position state ─────────────────────────────────────────────────
         self._in_position        = False
         self._tp_price:   Optional[float]        = None
         self._sl_price:   Optional[float]        = None
@@ -146,10 +197,10 @@ class FuturesTrader:
         # Last-seen unrealized PnL — used to estimate PnL on external close
         self._last_known_pnl: float = 0.0
 
-        # Cooldown
+        # ── Cooldown ───────────────────────────────────────────────────────
         self._cooldown_bars_remaining = 0
 
-        # Signal timing
+        # ── Signal timing ──────────────────────────────────────────────────
         self._last_1m_candle_ts: Optional[int]   = None
         self._last_5m_candle_ts: Optional[int]   = None
         self._last_eval_time:    float            = 0.0
@@ -184,6 +235,40 @@ class FuturesTrader:
                 self._last_1m_candle_ts = ts_1m
                 return True
         return False
+
+    # ── Managed run loop (used by run_bot_managed.py) ────────────────────
+
+    async def run(self, stop_event=None):
+        """
+        Managed run loop — used when launched by Laravel.
+        Checks stop_event and reporter stop command every cycle.
+        Falls back to _is_active flag for compatibility with run_bot.py.
+        """
+        _stop = stop_event or self._stop_event
+
+        if self._reporter:
+            # NOTE: reporter.start() is called by run_bot_managed.py BEFORE run() is called.
+            # Do NOT call reporter.start() here — it would create duplicate background tasks
+            # (heartbeat + flush) which cause logs and trade data to be lost.
+            self._reporter.queue_log(
+                "info", f"🚀 Bot started — trading {self.symbol} on {self.TIMEFRAME} timeframe"
+            )
+
+        while self._is_active:
+            # ── Graceful shutdown checks ──────────────────────────────────
+            if _stop and _stop.is_set():
+                logger.info(f"[MANAGED] Stop event set — {self.symbol} shutting down.")
+                break
+            if self._reporter and self._reporter.should_stop():
+                logger.info(f"[MANAGED] Stop command from Laravel — {self.symbol} shutting down.")
+                break
+
+            await self.run_cycle()
+            await asyncio.sleep(5)
+
+        if self._reporter:
+            self._reporter.queue_log("info", f"🛑 Bot stopped — {self.symbol}")
+            await self._reporter.flush()
 
     # ── Reconciliation ────────────────────────────────────────────────────
 
@@ -378,6 +463,7 @@ class FuturesTrader:
                 return
 
             # ── Volatility gate ───────────────────────────────────────────
+            atr_ratio = 0.0
             if "atr" in df.columns:
                 atr_s = df["atr"].dropna()
                 if len(atr_s) >= 20:
@@ -389,12 +475,26 @@ class FuturesTrader:
                             f"[SKIP:LOW_VOL] {self.symbol} — "
                             f"ATR_ratio={atr_ratio:.2f} < {self.ATR_RATIO_MIN:.2f}"
                         )
+                        if self._reporter:
+                            self._reporter.queue_log(
+                                "info",
+                                f"📉 {self.symbol} — Market too quiet (volatility {atr_ratio:.0%} of average). "
+                                f"Waiting for a better setup.",
+                                channel="signal"
+                            )
                         self._last_eval_time = time.monotonic()
                         return
 
             # ── Signal evaluation ─────────────────────────────────────────
             prediction = self.model.predict(df, df_1h=df_1h)
             self._last_eval_time = time.monotonic()
+
+            # Capture metadata for reporter and trade recording
+            agreement = ""
+            if "]" in prediction.reasoning:
+                agreement = prediction.reasoning.split("]")[0].replace("[HYBRID ", "")
+            self._last_signal_type = "AGREE" if "AGREE" in agreement else "SPLIT"
+            self._last_regime      = regime_params.regime.value if regime_params else None
 
             logger.info(
                 f"[SIGNAL] {self.symbol} → {prediction.signal.value} | "
@@ -403,10 +503,16 @@ class FuturesTrader:
 
             if prediction.signal == Signal.HOLD:
                 logger.info(f"[HOLD] {self.symbol}")
+                if self._reporter:
+                    self._reporter.queue_log(
+                        "info",
+                        f"🔍 {self.symbol} — Analysed market. No clear trade opportunity right now "
+                        f"(confidence {prediction.confidence:.0%}, regime: {self._last_regime}). Watching.",
+                        channel="signal"
+                    )
                 return
 
             side = OrderSide.LONG if prediction.signal == Signal.LONG else OrderSide.SHORT
-
             eff_threshold = self._effective_threshold(regime_params, side)
 
             if prediction.confidence < eff_threshold:
@@ -414,25 +520,57 @@ class FuturesTrader:
                     f"[SKIP:CONF] {self.symbol} — "
                     f"conf={prediction.confidence:.0%} < threshold={eff_threshold:.0%}"
                 )
+                if self._reporter:
+                    direction = "LONG 📈" if side == OrderSide.LONG else "SHORT 📉"
+                    self._reporter.queue_log(
+                        "info",
+                        f"🔍 {self.symbol} — {direction} signal seen but confidence too low "
+                        f"({prediction.confidence:.0%} < required {eff_threshold:.0%}). Skipped.",
+                        channel="signal"
+                    )
                 return
 
             # ── AGREE filter (TRENDING only) ──────────────────────────────
-            agreement = ""
-            if "]" in prediction.reasoning:
-                agreement = prediction.reasoning.split("]")[0].replace("[HYBRID ", "")
-
             if regime_params.require_agree and "AGREE" not in agreement:
                 if prediction.confidence >= eff_threshold + 0.15:
                     logger.info(
                         f"[SPLIT:STRONG] {self.symbol} — high conf "
                         f"{prediction.confidence:.0%} in TRENDING, proceeding"
                     )
+                    if self._reporter:
+                        self._reporter.queue_log(
+                            "info",
+                            f"⚡ {self.symbol} — Strong signal ({prediction.confidence:.0%}) detected "
+                            f"in trending market. Proceeding despite split models.",
+                            channel="signal"
+                        )
                 else:
                     logger.info(
                         f"[SKIP:SPLIT] {self.symbol} — TRENDING requires AGREE. "
                         f"conf={prediction.confidence:.0%}"
                     )
+                    if self._reporter:
+                        self._reporter.queue_log(
+                            "info",
+                            f"🔍 {self.symbol} — Models disagree on direction in trending market. "
+                            f"Skipping to avoid risky trade.",
+                            channel="signal"
+                        )
                     return
+
+            # ── Reporter: signal event ─────────────────────────────────────
+            if self._reporter:
+                await self._reporter.report_signal(
+                    symbol          = self.symbol,
+                    signal          = prediction.signal.value,
+                    confidence      = prediction.confidence,
+                    signal_type     = self._last_signal_type,
+                    regime          = self._last_regime,
+                    adx             = regime_params.adx if hasattr(regime_params, "adx") else None,
+                    atr_ratio       = atr_ratio,
+                    action_taken    = "evaluating",
+                    price_at_signal = current_price,
+                )
 
             # ── Risk checks ───────────────────────────────────────────────
             balance    = await self.exchange.get_balance()
@@ -440,6 +578,12 @@ class FuturesTrader:
 
             if self.risk.is_daily_limit_hit(balance):
                 logger.warning(f"[DAILY LIMIT] {self.symbol} — trading paused")
+                if self._reporter:
+                    self._reporter.queue_log(
+                        "warning",
+                        f"🚫 {self.symbol} — Daily loss limit reached. Bot is paused for today to protect your account.",
+                        channel="bot"
+                    )
                 return
 
             atr = float(df["atr"].iloc[-1]) if "atr" in df.columns else None
@@ -458,6 +602,12 @@ class FuturesTrader:
 
             if not trade_params.approved:
                 logger.warning(f"[REJECTED] {self.symbol} — {trade_params.reject_reason}")
+                if self._reporter:
+                    self._reporter.queue_log(
+                        "warning",
+                        f"⚠️ {self.symbol} — Trade rejected by risk manager: {trade_params.reject_reason}",
+                        channel="bot"
+                    )
                 return
 
             if self.recovery.is_in_recovery(self.symbol):
@@ -465,11 +615,25 @@ class FuturesTrader:
                     mult = self.recovery.get_recovery_size_multiplier(self.symbol)
                     trade_params.quantity = round(trade_params.quantity * mult, 3)
                     logger.info(f"[RECOVERY] {self.symbol} size x{mult:.1f}")
+                    if self._reporter:
+                        self._reporter.queue_log(
+                            "info",
+                            f"🔄 {self.symbol} — Recovery mode: increasing position size by {mult:.1f}x "
+                            f"to recover previous loss.",
+                            channel="bot"
+                        )
                     # Reset wait counter — a qualifying signal fired
                     if self.symbol in self.recovery._states:
                         self.recovery._states[self.symbol].wait_bars = 0
                 else:
                     logger.info(f"[RECOVERY WAIT] {self.symbol}")
+                    if self._reporter:
+                        self._reporter.queue_log(
+                            "info",
+                            f"⏳ {self.symbol} — In recovery mode. Waiting for a high-confidence "
+                            f"signal before re-entering.",
+                            channel="bot"
+                        )
                     return
 
             self._entry_confidence = prediction.confidence
@@ -499,7 +663,7 @@ class FuturesTrader:
                 logger.info(f"[TIMEOUT] {self.symbol} {max_bars} bars (no SL/TP mode)")
                 await asyncio.sleep(self.SETTLE_DELAY)
                 await self._close_with_retry(
-                    "TIMEOUT", pos.unrealized_pnl, 0.0, regime_params
+                    "TIMEOUT", pos.unrealized_pnl, 0.0, regime_params, current_price
                 )
             return
 
@@ -512,20 +676,47 @@ class FuturesTrader:
             else (entry - current_price) / sl_dist
         )
 
+        _elapsed_min = (
+            (time.monotonic() - self._position_opened_at) / 60.0
+            if self._position_opened_at else 0.0
+        )
         logger.info(
             f"[WATCHING] {self.symbol} {side.value.upper()} | "
             f"entry={entry:.4f} now={current_price:.4f} | "
             f"TP={self._tp_price:.4f}  SL={self._sl_price:.4f} | "
             f"R={current_r:+.2f}  PnL={pos.unrealized_pnl:+.4f} | "
-            f"bars={self._bars_held}/{self._get_timeout(regime_params)}"
+            f"bars={self._bars_held}/{self._get_timeout(regime_params)} | "
+            f"open={_elapsed_min:.0f}m/{self.MAX_TRADE_DURATION_MINUTES}m"
         )
+
+        # ── Hard 60-minute wall-clock cap (checked before everything else) ─────
+        if self._position_opened_at is not None:
+            elapsed_min = (time.monotonic() - self._position_opened_at) / 60.0
+            if elapsed_min >= self.MAX_TRADE_DURATION_MINUTES:
+                logger.warning(
+                    f"[HARD TIMEOUT] {self.symbol} — position open for "
+                    f"{elapsed_min:.1f} min >= {self.MAX_TRADE_DURATION_MINUTES} min cap. "
+                    f"Force-closing regardless of P&L."
+                )
+                if self._reporter:
+                    self._reporter.queue_log(
+                        "warning",
+                        f"\u23f1\ufe0f {self.symbol} — Position exceeded {self.MAX_TRADE_DURATION_MINUTES}-minute "
+                        f"max hold time ({elapsed_min:.0f} min open). Force-closing now.",
+                        channel="trade"
+                    )
+                await asyncio.sleep(self.SETTLE_DELAY)
+                await self._close_with_retry(
+                    "HARD_TIMEOUT", pos.unrealized_pnl, current_r, regime_params, current_price
+                )
+                return
 
         # ── TP hit ────────────────────────────────────────────────────────
         if (current_price >= self._tp_price if side == OrderSide.LONG
                 else current_price <= self._tp_price):
             logger.info(f"[TP HIT] {self.symbol}")
             await asyncio.sleep(self.SETTLE_DELAY)
-            await self._close_with_retry("TP", pos.unrealized_pnl, current_r, regime_params)
+            await self._close_with_retry("TP", pos.unrealized_pnl, current_r, regime_params, current_price)
             return
 
         # ── SL hit ────────────────────────────────────────────────────────
@@ -533,7 +724,7 @@ class FuturesTrader:
                 else current_price >= self._sl_price):
             logger.info(f"[SL HIT] {self.symbol}")
             await asyncio.sleep(self.SETTLE_DELAY)
-            await self._close_with_retry("SL", pos.unrealized_pnl, current_r, regime_params)
+            await self._close_with_retry("SL", pos.unrealized_pnl, current_r, regime_params, current_price)
             return
 
         # ── Partial TP ────────────────────────────────────────────────────
@@ -556,11 +747,16 @@ class FuturesTrader:
                     self._partial_exit_taken = True
                     self._breakeven_moved    = True
                     logger.info(f"[PARTIAL TP OK] {self.symbol} SL → breakeven {self._sl_price:.4f}")
+                    if self._reporter:
+                        self._reporter.queue_log("info",
+                            f"🎯 {self.symbol} — Took 50% profit at {current_price:.4f} (R={current_r:+.2f}). "
+                            f"Stop loss moved to breakeven. Riding the rest.",
+                            channel="trade")
                 else:
                     logger.info(f"[PARTIAL TP FALLBACK] {self.symbol} — attempting full close")
                     await asyncio.sleep(self.SETTLE_DELAY)
                     await self._close_with_retry(
-                        "PARTIAL_TP_FULL", pos.unrealized_pnl, current_r, regime_params
+                        "PARTIAL_TP_FULL", pos.unrealized_pnl, current_r, regime_params, current_price
                     )
                     return
 
@@ -571,6 +767,10 @@ class FuturesTrader:
                 logger.info(f"[BREAKEVEN] {self.symbol} SL {self._sl_price:.4f} → {new_sl:.4f}")
                 self._sl_price        = new_sl
                 self._breakeven_moved = True
+                if self._reporter:
+                    self._reporter.queue_log("info",
+                        f"🛡️ {self.symbol} — Stop loss moved to breakeven at {new_sl:.4f}. Position is now risk-free.",
+                        channel="trade")
 
         # ── Early profit exit ─────────────────────────────────────────────
         early_r = regime_params.early_profit_r
@@ -582,7 +782,7 @@ class FuturesTrader:
             logger.info(f"[EARLY PROFIT] {self.symbol} R={current_r:+.2f} >= {early_r:.2f}R")
             await asyncio.sleep(self.SETTLE_DELAY)
             await self._close_with_retry(
-                "EARLY_PROFIT", pos.unrealized_pnl, current_r, regime_params
+                "EARLY_PROFIT", pos.unrealized_pnl, current_r, regime_params, current_price
             )
             return
 
@@ -595,7 +795,7 @@ class FuturesTrader:
                 logger.info(f"[REVERSAL EXIT] {self.symbol} R={current_r:+.2f}")
                 await asyncio.sleep(self.SETTLE_DELAY)
                 await self._close_with_retry(
-                    "REVERSAL", pos.unrealized_pnl, current_r, regime_params
+                    "REVERSAL", pos.unrealized_pnl, current_r, regime_params, current_price
                 )
                 return
             else:
@@ -607,11 +807,14 @@ class FuturesTrader:
             logger.info(f"[TIMEOUT] {self.symbol} {max_bars} bars")
             await asyncio.sleep(self.SETTLE_DELAY)
             await self._close_with_retry(
-                "TIMEOUT", pos.unrealized_pnl, current_r, regime_params
+                "TIMEOUT", pos.unrealized_pnl, current_r, regime_params, current_price
             )
 
     def _get_timeout(self, regime_params: RegimeParams) -> int:
-        return self.TIMEOUT_BARS.get(regime_params.regime, 16)
+        bars = self.TIMEOUT_BARS.get(regime_params.regime, 8)
+        # Never let bar-based timeout exceed the hard wall-clock cap
+        cap_bars = (self.MAX_TRADE_DURATION_MINUTES * 60) // (5 * 60)   # 5-min bars
+        return min(bars, cap_bars)
 
     # ── Trade execution ───────────────────────────────────────────────────
 
@@ -640,6 +843,7 @@ class FuturesTrader:
             self._breakeven_moved     = False
             self._partial_exit_taken  = False
             self._last_known_pnl      = 0.0
+            self._position_opened_at  = time.monotonic()
 
             if not self._sl_price or not self._tp_price:
                 logger.warning(
@@ -649,14 +853,48 @@ class FuturesTrader:
                 )
 
             self.risk.portfolio.register_open(self.symbol, params.side)
+            direction = "LONG 📈" if params.side == OrderSide.LONG else "SHORT 📉"
             logger.info(
                 f"[OPENED] #{self._trades_opened} {params.symbol} "
                 f"{params.side.value.upper()} | "
                 f"qty={params.quantity} @ {result.price:.4f} | "
                 f"TP={params.take_profit:.4f} | SL={params.stop_loss:.4f}"
             )
+
+            # ── Reporter: trade open ───────────────────────────────────────
+            if self._reporter:
+                self._reporter.queue_log(
+                    "info",
+                    f"✅ Trade opened: {direction} {params.symbol} | "
+                    f"Entry: {result.price:.4f} | Qty: {params.quantity} | "
+                    f"TP: {params.take_profit:.4f} | SL: {params.stop_loss:.4f} | "
+                    f"Confidence: {self._entry_confidence:.0%}",
+                    channel="trade"
+                )
+                trade_id = await self._reporter.report_trade_open(
+                    symbol      = self.symbol,
+                    side        = params.side.value,
+                    entry_price = result.price,
+                    quantity    = params.quantity,
+                    leverage    = params.leverage,
+                    tp_price    = params.take_profit,
+                    sl_price    = params.stop_loss,
+                    confidence  = self._entry_confidence,
+                    signal_type = self._last_signal_type,
+                    regime      = self._last_regime,
+                    risk_usdt   = getattr(params, "risk_amount", None),
+                    order_id    = getattr(result, "order_id", None),
+                )
+                if trade_id:
+                    self._trade_ids[self.symbol] = trade_id
         else:
             logger.error(f"[FAILED] {params.symbol}: {result.message}")
+            if self._reporter:
+                self._reporter.queue_log(
+                    "error",
+                    f"❌ Failed to open trade on {params.symbol}: {result.message}",
+                    channel="trade"
+                )
 
     async def _close_with_retry(
         self,
@@ -664,17 +902,10 @@ class FuturesTrader:
         pnl:           float,
         pnl_r:         float = 0.0,
         regime_params: Optional[RegimeParams] = None,
+        current_price: float = None,
     ):
         """
         Reliable close with verification and retry.
-
-        After the settle delay (already waited by caller), attempt to close.
-        If exchange returns 'No open position':
-          - Re-fetch positions to verify the position is truly gone.
-          - If gone  → record as externally closed and reset state (correct).
-          - If still there → retry up to MAX_CLOSE_RETRIES.
-          - If all retries exhausted → log CRITICAL, keep _in_position=True
-            so the reconciler catches it on the next cycle.
         """
         for attempt in range(1, self.MAX_CLOSE_RETRIES + 1):
             result = await self.exchange.close_position(self.symbol)
@@ -688,6 +919,28 @@ class FuturesTrader:
                 regime_name = regime_params.regime.value if regime_params else "UNKNOWN"
                 self._record_trade_outcome(pnl, reason, regime_name)
                 self.risk.portfolio.register_close(self.symbol, profit=(pnl >= 0))
+
+                # ── Reporter: trade close ──────────────────────────────────
+                if self._reporter:
+                    pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                    self._reporter.queue_log(
+                        "info",
+                        f"{pnl_emoji} Trade closed ({reason}): {self.symbol} | "
+                        f"P&L: {pnl:+.4f} USDT | R: {pnl_r:+.2f} | Bars held: {self._bars_held}",
+                        channel="trade"
+                    )
+                    trade_id = self._trade_ids.pop(self.symbol, None)
+                    await self._reporter.report_trade_close(
+                        symbol=self.symbol,
+                        side=self._position_side.value if self._position_side else "long",
+                        exit_price=current_price or 0.0,
+                        pnl_usdt=pnl,
+                        pnl_r=pnl_r,
+                        exit_reason=reason,
+                        bars_held=self._bars_held,
+                        trade_id=trade_id,
+                    )
+
                 self._reset_position_state()
                 self._cooldown_bars_remaining = self.COOLDOWN_BARS
                 return
@@ -715,6 +968,17 @@ class FuturesTrader:
                 regime_name = regime_params.regime.value if regime_params else "UNKNOWN"
                 self._record_trade_outcome(pnl, f"{reason}_EXTERNAL", regime_name)
                 self.risk.portfolio.register_close(self.symbol, profit=(pnl >= 0))
+                if self._reporter:
+                    pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                    self._reporter.queue_log("info",
+                        f"{pnl_emoji} Trade closed externally ({reason}): {self.symbol} | P&L: {pnl:+.4f} USDT",
+                        channel="trade")
+                    trade_id = self._trade_ids.pop(self.symbol, None)
+                    await self._reporter.report_trade_close(
+                        symbol=self.symbol, side=self._position_side.value if self._position_side else "long",
+                        exit_price=current_price or 0.0, pnl_usdt=pnl, pnl_r=pnl_r,
+                        exit_reason=f"{reason}_EXTERNAL", bars_held=self._bars_held, trade_id=trade_id,
+                    )
                 self._reset_position_state()
                 self._cooldown_bars_remaining = self.COOLDOWN_BARS
                 return
@@ -745,6 +1009,18 @@ class FuturesTrader:
         regime_name = regime_params.regime.value if regime_params else "UNKNOWN"
         self._record_trade_outcome(pnl, f"{reason}_SETTLEMENT", regime_name)
         self.risk.portfolio.register_close(self.symbol, profit=(pnl >= 0))
+        if self._reporter:
+            pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+            self._reporter.queue_log("warning",
+                f"{pnl_emoji} Trade closed (settlement): {self.symbol} | P&L: {pnl:+.4f} USDT | "
+                f"Position settled on exchange before bot could close it.",
+                channel="trade")
+            trade_id = self._trade_ids.pop(self.symbol, None)
+            await self._reporter.report_trade_close(
+                symbol=self.symbol, side=self._position_side.value if self._position_side else "long",
+                exit_price=current_price or 0.0, pnl_usdt=pnl, pnl_r=pnl_r,
+                exit_reason=f"{reason}_SETTLEMENT", bars_held=self._bars_held, trade_id=trade_id,
+            )
         self._reset_position_state()
         self._cooldown_bars_remaining = self.COOLDOWN_BARS
 
@@ -783,6 +1059,7 @@ class FuturesTrader:
         self._partial_exit_taken = False
         self._last_known_pnl     = 0.0
         self._last_eval_time     = 0.0
+        self._position_opened_at = None
 
     # ── Utilities ─────────────────────────────────────────────────────────
 

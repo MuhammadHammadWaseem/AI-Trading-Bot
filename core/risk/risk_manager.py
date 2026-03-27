@@ -174,6 +174,8 @@ class RiskManager:
     def is_daily_limit_hit(self, balance: AccountBalance) -> bool:
         if self._session_start_balance <= 0:
             return False
+
+        # Check percentage-based limit
         pct = (self._daily_loss_usdt / self._session_start_balance) * 100
         if pct >= self.settings.max_daily_loss_pct:
             logger.error(
@@ -181,6 +183,16 @@ class RiskManager:
                 f"— stopping all trades"
             )
             return True
+
+        # Check absolute USDT limit (from Laravel config, 0 = disabled)
+        if self.settings.max_daily_loss_usdt > 0:
+            if self._daily_loss_usdt >= self.settings.max_daily_loss_usdt:
+                logger.error(
+                    f"Daily USDT loss limit hit: {self._daily_loss_usdt:.2f} >= "
+                    f"{self.settings.max_daily_loss_usdt:.2f} USDT — stopping all trades"
+                )
+                return True
+
         return False
 
     def calculate_trade(
