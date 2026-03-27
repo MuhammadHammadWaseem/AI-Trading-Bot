@@ -197,10 +197,17 @@ class LaravelReporter:
         bars_held: Optional[int] = None,
         trade_id: Optional[int] = None,
     ):
+        # Clamp pnl_r to ±9999 — extreme values (e.g. 1,166,999) indicate a
+        # near-zero risk denominator and would overflow DECIMAL(12,4) in MySQL.
+        # The sign is preserved so wins/losses are still correctly reflected.
+        safe_pnl_r = None
+        if pnl_r is not None:
+            safe_pnl_r = round(max(-9999.0, min(9999.0, float(pnl_r))), 4)
+
         payload = {
             "trade_id": trade_id, "symbol": symbol, "side": side.lower(),
             "exit_price": exit_price, "pnl_usdt": round(float(pnl_usdt), 4),
-            "pnl_r": round(float(pnl_r), 4) if pnl_r is not None else None,
+            "pnl_r": safe_pnl_r,
             "exit_reason": exit_reason, "bars_held": bars_held,
             "closed_at": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
         }
