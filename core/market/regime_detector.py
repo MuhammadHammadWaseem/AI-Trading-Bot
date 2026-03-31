@@ -40,6 +40,7 @@ class RegimeParams:
     size_scale:     float
     early_profit_r: float
     require_agree:  bool
+    conf_threshold: float = 0.0
 
 
 class RegimeDetector:
@@ -91,13 +92,14 @@ class RegimeDetector:
         self._pending_regime:   Optional[Regime] = None
         self._pending_count:    int = 0
 
-    def detect(self, df: pd.DataFrame) -> RegimeParams:
+    def detect(self, df: pd.DataFrame, base_conf_threshold: float = 0.55) -> RegimeParams:
         raw = self._compute_raw(df)
         self._update_confirmation(raw)
 
         params   = self._PARAMS[self._confirmed_regime]
-        base_thr = 0.55   # matches FuturesTrader.BASE_THRESHOLD
+        base_thr = base_conf_threshold
         conf_thr = min(0.85, base_thr + params.conf_thr_delta)
+        params.conf_threshold = conf_thr
 
         atr   = float(df["atr"].iloc[-1])   if "atr" in df.columns else 0.0
         adx   = float(df["adx"].iloc[-1])   if "adx" in df.columns else 0.0

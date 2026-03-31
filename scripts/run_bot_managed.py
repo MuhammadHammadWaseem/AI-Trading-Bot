@@ -167,6 +167,12 @@ async def main():
         logger.info(f"[MANAGED] Account balance: {balance.total_balance:.2f} USDT")
 
         # ── Build trader ─────────────────────────────────────────────────
+        # ── Pass user settings to trader ───────────────────────────────
+        # FIX: base_confidence_threshold was never passed here, so the bot
+        # always used the class-level default (0.55 = 55%) regardless of what
+        # the user configured in the dashboard. Now it reads from config JSON.
+        base_threshold = config.get("base_confidence_threshold", None)
+
         trader = FuturesTrader(
             exchange          = exchange,
             symbol            = config["symbol"],
@@ -175,13 +181,38 @@ async def main():
             recalibrator      = SignalRecalibrator(log_dir=settings.logs_dir),
             reporter          = reporter,
             stop_event        = stop_event,
+            base_threshold    = base_threshold,   # ← FIX: user-defined min confidence
         )
+
+        # Log the effective threshold so the user can see it in the dashboard
+        if base_threshold is not None:
+            eff = base_threshold if base_threshold <= 1 else base_threshold / 100.0
+            logger.info(
+                f"[MANAGED] Min confidence threshold set to {eff:.0%} "                f"(from dashboard config). Trades below this level will be skipped."
+            )
 
         # ── Report running THEN start main loop ──────────────────────────
         # NOTE: reporter.start() was already called above — do NOT call it again.
         # FuturesTrader.run() will NOT call reporter.start() (patched separately).
         await reporter.report_status("running")
         await trader.run(stop_event=stop_event)
+
+        # ── Post-run: close positions if user requested it ────────────────
+        if reporter.should_close_trades():
+            logger.info("[MANAGED] Closing all open positions as requested by user...")
+            reporter.queue_log(
+                "info", "🔴 Closing all open positions on exchange as requested...", channel="bot"
+            )
+            try:
+                await trader.close_all_positions_for_shutdown()
+            except Exception as e:
+                logger.warning(f"[MANAGED] Error during position close: {e}")
+                reporter.queue_log(
+                    "warning",
+                    f"⚠️ Could not auto-close all positions: {e}. Please check exchange manually.",
+                    channel="bot"
+                )
+            await reporter.flush()
 
         _final_status  = "stopped"
         _final_message = ""

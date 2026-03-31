@@ -216,11 +216,27 @@ class FuturesTrader:
         return None
 
     def _effective_threshold(self, regime_params: RegimeParams, side: OrderSide) -> float:
+        """
+        Compute the effective confidence threshold for this signal.
+
+        USER THRESHOLD IS A HARD FLOOR:
+        BASE_THRESHOLD is set from the user's dashboard setting (base_confidence_threshold).
+        Regime adjustments and recalibration can only RAISE the threshold above the
+        user's minimum — they can never lower it below what the user configured.
+        This ensures the contract: 'I set 68%, no trade below 68%' is always honoured.
+        """
         recalib_adj = self.recalibrator.get_threshold_adjustment(
             self.symbol, side.value) / 100.0
         recalib_adj = max(-self.RECALIB_CAP, min(self.RECALIB_CAP, recalib_adj))
+
+        # Start from regime-adjusted threshold
         eff = self.BASE_THRESHOLD + regime_params.conf_thr_delta + recalib_adj
-        return min(0.85, max(0.45, eff))
+
+        # HARD FLOOR: never go below user's configured minimum, regardless of
+        # regime or recalibration adjustments.
+        eff = max(eff, self.BASE_THRESHOLD)
+
+        return min(0.95, max(self.BASE_THRESHOLD, eff))
 
     def _should_evaluate_signal(self, df_1m, force: bool = False) -> bool:
         if force:
@@ -269,6 +285,41 @@ class FuturesTrader:
         if self._reporter:
             self._reporter.queue_log("info", f"🛑 Bot stopped — {self.symbol}")
             await self._reporter.flush()
+
+    async def close_all_positions_for_shutdown(self):
+        """
+        Close all open positions on the exchange.
+        Called by run_bot_managed.py when user chose 'Stop AND close trades'.
+        """
+        try:
+            positions = await self.exchange.get_open_positions()
+            if not positions:
+                logger.info("[MANAGED] No open positions to close.")
+                return
+
+            for pos in positions:
+                sym = pos.symbol
+                side_str = "short" if pos.side.value == "long" else "long"  # close opposite
+                logger.info(f"[MANAGED] Closing position: {sym} ({pos.side.value})")
+                if self._reporter:
+                    self._reporter.queue_log(
+                        "info", f"🔴 Closing {sym} {pos.side.value} position @ market...", channel="trade"
+                    )
+                try:
+                    await self.exchange.close_position(sym)
+                    logger.info(f"[MANAGED] Closed {sym} successfully.")
+                    if self._reporter:
+                        self._reporter.queue_log(
+                            "info", f"✅ {sym} position closed successfully.", channel="trade"
+                        )
+                except Exception as e:
+                    logger.warning(f"[MANAGED] Failed to close {sym}: {e}")
+                    if self._reporter:
+                        self._reporter.queue_log(
+                            "warning", f"⚠️ Failed to close {sym}: {e}. Close manually on exchange.", channel="trade"
+                        )
+        except Exception as e:
+            logger.warning(f"[MANAGED] Error fetching positions for close: {e}")
 
     # ── Reconciliation ────────────────────────────────────────────────────
 
@@ -415,7 +466,14 @@ class FuturesTrader:
                 pass
 
             # ── Regime detection ──────────────────────────────────────────
-            regime_params = self.regime.detect(df)
+            # FIX: Pass user's BASE_THRESHOLD so regime log shows the correct
+            # conf_thr value. Previously detect() used its own hardcoded default
+            # (~0.52), causing regime log to show '57%' while trades were actually
+            # blocked at 72%. Now both values reflect the user's configuration.
+            regime_params = self.regime.detect(
+                df,
+                base_conf_threshold=self.BASE_THRESHOLD,
+            )
             self._last_regime_params = regime_params
 
             # ── Track 5m bars ─────────────────────────────────────────────
@@ -454,12 +512,32 @@ class FuturesTrader:
                 logger.info(
                     f"[COOLDOWN] {self.symbol} — {self._cooldown_bars_remaining} bars remaining"
                 )
+                if self._reporter:
+                    self._reporter.queue_log(
+                        "info",
+                        f"⏳ {self.symbol} — Cooldown after last trade: "
+                        f"{self._cooldown_bars_remaining} bars remaining before next signal evaluation.",
+                        channel="signal"
+                    )
                 return
 
             # ── Signal timing gate ────────────────────────────────────────
             first_cycle = (self._last_eval_time == 0.0)
             if not self._should_evaluate_signal(df_1m, force=first_cycle):
                 logger.info(f"[GATE] {self.symbol} — waiting for next eval window")
+                if self._reporter and self._cycles % 3 == 0:  # log every ~15s not every 5s
+                    price_str = ""
+                    try:
+                        if df is not None and len(df) > 0:
+                            price_str = f" | Price: {df['close'].iloc[-1]:.2f}"
+                    except Exception:
+                        pass
+                    self._reporter.queue_log(
+                        "info",
+                        f"👁 {self.symbol} — Monitoring market{price_str}. "
+                        f"Waiting for next candle to evaluate signal.",
+                        channel="signal"
+                    )
                 return
 
             # ── Volatility gate ───────────────────────────────────────────
@@ -532,9 +610,9 @@ class FuturesTrader:
 
             # ── AGREE filter (TRENDING only) ──────────────────────────────
             if regime_params.require_agree and "AGREE" not in agreement:
-                if prediction.confidence >= eff_threshold + 0.15:
+                if prediction.confidence >= eff_threshold + 0.20:  # 92%+ required to override AGREE
                     logger.info(
-                        f"[SPLIT:STRONG] {self.symbol} — high conf "
+                        f"[SPLIT:STRONG] {self.symbol} — high conf (≥92%) "
                         f"{prediction.confidence:.0%} in TRENDING, proceeding"
                     )
                     if self._reporter:
@@ -600,6 +678,12 @@ class FuturesTrader:
                 size_scale=regime_params.size_scale,
             )
 
+            logger.info(
+                f"[TRADE_PARAMS] {self.symbol} {side.value.upper()} | "
+                f"SL={trade_params.stop_loss:.2f} ({regime_params.sl_mult:.2f}x ATR) | "
+                f"TP={trade_params.take_profit:.2f} ({regime_params.tp_mult * 1.5:.2f}x ATR) | "
+                f"Qty={trade_params.quantity:.4f} | Risk=${trade_params.risk_amount_usdt:.2f}"
+            )
             if not trade_params.approved:
                 logger.warning(f"[REJECTED] {self.symbol} — {trade_params.reject_reason}")
                 if self._reporter:

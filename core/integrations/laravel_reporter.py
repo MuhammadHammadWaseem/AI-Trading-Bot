@@ -45,7 +45,8 @@ class LaravelReporter:
         self._session:        Optional[aiohttp.ClientSession] = None
         self._log_buffer:     list[_PendingLog] = []
         self._last_flush:     float = time.monotonic()
-        self._stop_requested: bool  = False
+        self._stop_requested:     bool  = False
+        self._close_trades_on_stop: bool  = False  # set from heartbeat stop command
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._flush_task:     Optional[asyncio.Task] = None
 
@@ -158,6 +159,10 @@ class LaravelReporter:
     def should_stop(self) -> bool:
         return self._stop_requested
 
+    def should_close_trades(self) -> bool:
+        """True if the dashboard stop command included 'close all trades'."""
+        return self._close_trades_on_stop
+
     async def report_trade_open(
         self,
         symbol: str, side: str, entry_price: float, quantity: float,
@@ -253,7 +258,12 @@ class LaravelReporter:
                 if resp:
                     for cmd in resp.get("commands", []):
                         if cmd.get("command") == "stop":
-                            logger.info("[Reporter] 🛑 Stop command received from Laravel.")
+                            close_trades = cmd.get("close_open_trades", False)
+                            self._close_trades_on_stop = close_trades
+                            logger.info(
+                                f"[Reporter] 🛑 Stop command received from Laravel. "
+                                f"{'Will close open positions before exit.' if close_trades else 'Positions will remain open on exchange.'}"
+                            )
                             self._stop_requested = True
             except asyncio.CancelledError:
                 break
