@@ -45,10 +45,18 @@ class LaravelReporter:
         self._session:        Optional[aiohttp.ClientSession] = None
         self._log_buffer:     list[_PendingLog] = []
         self._last_flush:     float = time.monotonic()
-        self._stop_requested:     bool  = False
+        self._stop_requested:       bool  = False
         self._close_trades_on_stop: bool  = False  # set from heartbeat stop command
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._flush_task:     Optional[asyncio.Task] = None
+
+        # ── Connectivity state ─────────────────────────────────────────────
+        # Tracks consecutive timeouts/errors so we log degraded state once
+        # rather than spamming a warning every 3-30 seconds.
+        self._consecutive_failures: int   = 0
+        self._laravel_reachable:    bool  = True   # assume up until proven otherwise
+        _FAILURE_WARN_THRESHOLD          = 3       # warn after N consecutive failures
+        self._FAILURE_WARN_THRESHOLD     = _FAILURE_WARN_THRESHOLD
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -284,10 +292,30 @@ class LaravelReporter:
     # ── HTTP helper ────────────────────────────────────────────────────────
 
     async def _post_safe(self, endpoint: str, payload: dict) -> Optional[dict]:
+        """
+        POST to Laravel with connectivity-aware logging.
+
+        On success: resets failure counter, logs reconnect if previously down.
+        On transient failure (timeout/connection refused): increments counter.
+          - First failure after success: log at WARNING.
+          - Subsequent failures while already known-down: log at DEBUG only,
+            so the log file isn't flooded with identical timeout warnings
+            (as seen in WinError 32 session where 3 bots × every 3s = spam).
+          - Recovery: logs one INFO line when Laravel comes back up.
+        """
         url = f"{self.api_url}/{endpoint}"
         try:
             session = await self._get_session()
             async with session.post(url, json=payload) as resp:
+                # ── Success path ───────────────────────────────────────────
+                if self._consecutive_failures >= self._FAILURE_WARN_THRESHOLD:
+                    logger.info(
+                        f"[Reporter] ✅ Laravel connection restored after "
+                        f"{self._consecutive_failures} failed attempt(s)."
+                    )
+                self._consecutive_failures = 0
+                self._laravel_reachable    = True
+
                 if resp.status == 401:
                     logger.warning(f"[Reporter] 401 Unauthorized on /{endpoint} — "
                                    f"bot_token may be invalid or expired")
@@ -304,12 +332,37 @@ class LaravelReporter:
                 if resp.content_type == "application/json":
                     return await resp.json()
                 return {"status": resp.status}
-        except aiohttp.ClientConnectorError as e:
-            logger.warning(f"[Reporter] Cannot reach Laravel /{endpoint}: {e}")
-        except asyncio.TimeoutError:
-            logger.warning(f"[Reporter] Timeout on /{endpoint}")
+
+        except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
+            self._consecutive_failures += 1
+            is_timeout = isinstance(e, asyncio.TimeoutError)
+            label = "Timeout" if is_timeout else "Connection refused"
+
+            if self._consecutive_failures == 1:
+                # First failure: always log at WARNING so it's visible
+                logger.warning(
+                    f"[Reporter] {label} on /{endpoint}. "
+                    f"Dashboard updates paused. Bot trading continues normally."
+                )
+                self._laravel_reachable = False
+            elif self._consecutive_failures == self._FAILURE_WARN_THRESHOLD:
+                # Nth failure: one summary warning, then silence until recovery
+                logger.warning(
+                    f"[Reporter] Laravel unreachable for {self._consecutive_failures} "
+                    f"consecutive requests. Suppressing further timeout warnings until "
+                    f"connection is restored. Start 'php artisan serve' to reconnect."
+                )
+            else:
+                # Already known-down: debug only — no log spam
+                logger.debug(
+                    f"[Reporter] {label} on /{endpoint} "
+                    f"(failure #{self._consecutive_failures}, Laravel still down)"
+                )
+
         except Exception as e:
+            self._consecutive_failures += 1
             logger.warning(f"[Reporter] HTTP error on /{endpoint}: {type(e).__name__}: {e}")
+
         return None
 
     # ── Logging integration ────────────────────────────────────────────────

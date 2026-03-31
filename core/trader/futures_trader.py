@@ -86,9 +86,9 @@ class FuturesTrader:
 
     # ── Position monitoring ────────────────────────────────────────────────
     TIMEOUT_BARS: dict = {
-        Regime.TRENDING:  10,   # 10 × 5m = 50 min
-        Regime.RANGING:    8,   #  8 × 5m = 40 min
-        Regime.HIGH_VOL:   6,   #  6 × 5m = 30 min
+        Regime.TRENDING:        10,   # 10 × 5m = 50 min
+        Regime.RANGE:            8,   #  8 × 5m = 40 min
+        Regime.HIGH_VOLATILITY:  6,   #  6 × 5m = 30 min
     }
     COOLDOWN_BARS = 3
 
@@ -230,6 +230,8 @@ class FuturesTrader:
         recalib_adj = max(-self.RECALIB_CAP, min(self.RECALIB_CAP, recalib_adj))
 
         # Start from regime-adjusted threshold
+        # regime_params.conf_thr_delta is the regime adjustment delta (e.g. +0.02pp).
+        # It is already relative (not absolute), so add directly to BASE_THRESHOLD.
         eff = self.BASE_THRESHOLD + regime_params.conf_thr_delta + recalib_adj
 
         # HARD FLOOR: never go below user's configured minimum, regardless of
@@ -966,7 +968,7 @@ class FuturesTrader:
                     confidence  = self._entry_confidence,
                     signal_type = self._last_signal_type,
                     regime      = self._last_regime,
-                    risk_usdt   = getattr(params, "risk_amount", None),
+                    risk_usdt   = params.risk_amount_usdt,
                     order_id    = getattr(result, "order_id", None),
                 )
                 if trade_id:
