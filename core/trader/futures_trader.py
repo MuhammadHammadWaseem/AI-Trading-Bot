@@ -196,6 +196,13 @@ class FuturesTrader:
 
         # Last-seen unrealized PnL — used to estimate PnL on external close
         self._last_known_pnl: float = 0.0
+        # Frozen SL distance (R-unit) set at trade open — never changes after that.
+        # Using the live self._sl_price for R calculations corrupts R after
+        # breakeven/trailing moves (sl_dist → 0.0001 → R inflates by 80,000×).
+        self._original_sl_dist: float = 1.0
+        # Cumulative realized PnL from partial TP closes within this trade.
+        # Needed so the final close reports combined PnL, not just remaining leg.
+        self._partial_realized_pnl: float = 0.0
 
         # ── Cooldown ───────────────────────────────────────────────────────
         self._cooldown_bars_remaining = 0
@@ -791,7 +798,11 @@ class FuturesTrader:
         entry = self._entry_price
         side  = pos.side
 
-        sl_dist   = abs(entry - self._sl_price) or 1.0
+        # Use the FROZEN original SL distance as the R-unit.
+        # After SL moves to breakeven, self._sl_price is entry ± 0.0001,
+        # making sl_dist ≈ 0.0001 and inflating R by ~80,000×.
+        # _original_sl_dist is set once at open and never changes.
+        sl_dist   = self._original_sl_dist or abs(entry - self._sl_price) or 1.0
         current_r = (
             (current_price - entry) / sl_dist if side == OrderSide.LONG
             else (entry - current_price) / sl_dist
@@ -867,7 +878,15 @@ class FuturesTrader:
                     self._sl_price           = entry + 0.0001 if side == OrderSide.LONG else entry - 0.0001
                     self._partial_exit_taken = True
                     self._breakeven_moved    = True
-                    logger.info(f"[PARTIAL TP OK] {self.symbol} SL → breakeven {self._sl_price:.4f}")
+                    # Accumulate the realized PnL from this partial close so the final
+                    # close can report the true combined PnL (partial + remaining leg).
+                    partial_realized = (
+                        (current_price - entry) * partial_qty if side == OrderSide.LONG
+                        else (entry - current_price) * partial_qty
+                    )
+                    self._partial_realized_pnl += partial_realized
+                    logger.info(f"[PARTIAL TP OK] {self.symbol} SL → breakeven {self._sl_price:.4f} | "
+                                f"partial_realized={partial_realized:+.4f} USDT")
                     if self._reporter:
                         self._reporter.queue_log("info",
                             f"🎯 {self.symbol} — Took 50% profit at {current_price:.4f} (R={current_r:+.2f}). "
@@ -965,6 +984,11 @@ class FuturesTrader:
             self._partial_exit_taken  = False
             self._last_known_pnl      = 0.0
             self._position_opened_at  = time.monotonic()
+            # Freeze the original SL distance as the R-unit for this trade.
+            # Position management (self._sl_price) and performance measurement
+            # (R calculation) must never share the same mutable value.
+            self._original_sl_dist    = abs(result.price - params.stop_loss) or 1.0
+            self._partial_realized_pnl = 0.0
 
             if not self._sl_price or not self._tp_price:
                 logger.warning(
@@ -1027,7 +1051,16 @@ class FuturesTrader:
     ):
         """
         Reliable close with verification and retry.
+        pnl is the unrealized_pnl of the remaining position at close time.
+        If a partial TP was taken, the true total PnL includes _partial_realized_pnl.
         """
+        if self._partial_realized_pnl != 0.0:
+            combined_pnl = pnl + self._partial_realized_pnl
+            logger.info(
+                f"[COMBINED PnL] {self.symbol} — remaining={pnl:+.4f} + "
+                f"partial={self._partial_realized_pnl:+.4f} = total={combined_pnl:+.4f} USDT"
+            )
+            pnl = combined_pnl
         for attempt in range(1, self.MAX_CLOSE_RETRIES + 1):
             result = await self.exchange.close_position(self.symbol)
 
@@ -1169,18 +1202,20 @@ class FuturesTrader:
     # ── State reset ───────────────────────────────────────────────────────
 
     def _reset_position_state(self):
-        self._in_position        = False
-        self._tp_price           = None
-        self._sl_price           = None
-        self._position_side      = None
-        self._entry_price        = None
-        self._entry_confidence   = 0.0
-        self._bars_held          = 0
-        self._breakeven_moved    = False
-        self._partial_exit_taken = False
-        self._last_known_pnl     = 0.0
-        self._last_eval_time     = 0.0
-        self._position_opened_at = None
+        self._in_position          = False
+        self._tp_price             = None
+        self._sl_price             = None
+        self._position_side        = None
+        self._entry_price          = None
+        self._entry_confidence     = 0.0
+        self._bars_held            = 0
+        self._breakeven_moved      = False
+        self._partial_exit_taken   = False
+        self._last_known_pnl       = 0.0
+        self._last_eval_time       = 0.0
+        self._position_opened_at   = None
+        self._original_sl_dist     = 1.0
+        self._partial_realized_pnl = 0.0
 
     # ── Utilities ─────────────────────────────────────────────────────────
 
