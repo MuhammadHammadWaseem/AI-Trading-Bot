@@ -261,9 +261,41 @@ class RiskManager:
                 take_profit = round(entry_price * (1 - tp / 100), 4)
                 stop_loss   = round(entry_price * (1 + sl / 100), 4)
 
+        # ── Guard 1: TP direction sanity ─────────────────────────────────
+        # For LONG: TP must be above entry. For SHORT: TP must be below entry.
+        # If ATR is extreme or sign is wrong, reject the trade.
+        if side == OrderSide.LONG and take_profit <= entry_price:
+            return self._reject(symbol, side, entry_price,
+                                f"TP direction wrong: LONG TP={take_profit} <= entry={entry_price}")
+        if side == OrderSide.SHORT and take_profit >= entry_price:
+            return self._reject(symbol, side, entry_price,
+                                f"TP direction wrong: SHORT TP={take_profit} >= entry={entry_price}")
+
+        # ── Guard 2: Minimum SL distance (prevents noise-level stops) ────
+        # SL must be at least 0.10% of entry price away from entry.
+        # A tighter SL will be hit by normal bid/ask spread or slippage.
+        MIN_SL_PCT = 0.10  # 0.10% minimum
+        sl_dist    = abs(entry_price - stop_loss)
+        min_sl_dist = entry_price * (MIN_SL_PCT / 100)
+        if sl_dist < min_sl_dist:
+            return self._reject(symbol, side, entry_price,
+                                f"SL too tight: sl_dist={sl_dist:.4f} < min={min_sl_dist:.4f} "
+                                f"({MIN_SL_PCT}% of entry). Risk of immediate noise stop-out.")
+
+        # ── Guard 3: Minimum R:R ratio ───────────────────────────────────
+        # TP distance must be at least 1.0× the SL distance.
+        # A lower ratio guarantees losses even with >50% win rate.
+        MIN_RR = 1.0
+        tp_dist = abs(entry_price - take_profit)
+        actual_rr = tp_dist / sl_dist if sl_dist > 0 else 0.0
+        if actual_rr < MIN_RR:
+            return self._reject(symbol, side, entry_price,
+                                f"R:R too low: tp_dist={tp_dist:.4f} / sl_dist={sl_dist:.4f} "
+                                f"= {actual_rr:.3f} < {MIN_RR}. Trade would be structurally unprofitable.")
+
         logger.info(
             f"Trade: {symbol} {side.value.upper()} | qty={quantity} | lev={lev}x | "
-            f"TP={take_profit} SL={stop_loss} | risk={risk_amount:.2f} USDT"
+            f"TP={take_profit} SL={stop_loss} | R:R={actual_rr:.2f} | risk={risk_amount:.2f} USDT"
         )
 
         return TradeParameters(

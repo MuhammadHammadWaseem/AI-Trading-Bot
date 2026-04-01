@@ -373,15 +373,49 @@ class FuturesTrader:
                     elif current_price >= self._sl_price:
                         exit_reason = "SL_EXTERNAL"
 
+            # ── Compute correct pnl_r from actual exit price ──────────────
+            # Use current_price as the best estimate of where the position
+            # was closed. sl_dist is always the original SL distance from entry.
+            pnl_r = 0.0
+            if self._entry_price and self._sl_price:
+                sl_dist = abs(self._entry_price - self._sl_price) or 1e-9
+                if self._position_side == OrderSide.LONG:
+                    pnl_r = (current_price - self._entry_price) / sl_dist
+                else:
+                    pnl_r = (self._entry_price - current_price) / sl_dist
+                pnl_r = max(-9999.0, min(9999.0, pnl_r))
+
             logger.warning(
                 f"[RECONCILE:{exit_reason}] {self.symbol} — position vanished on exchange. "
-                f"estimated_pnl={estimated_pnl:+.4f} USDT | "
+                f"estimated_pnl={estimated_pnl:+.4f} USDT | R={pnl_r:+.2f} | "
                 f"last_price={current_price:.4f} | bars_held={self._bars_held}"
             )
 
             regime_name = regime_params.regime.value if regime_params else "UNKNOWN"
             self._record_trade_outcome(estimated_pnl, exit_reason, regime_name)
             self.risk.portfolio.register_close(self.symbol, profit=(estimated_pnl >= 0))
+
+            # Report the external close to Laravel so the trade is recorded correctly
+            if self._reporter:
+                pnl_emoji = "🟢" if estimated_pnl >= 0 else "🔴"
+                self._reporter.queue_log(
+                    "warning",
+                    f"{pnl_emoji} Trade closed externally ({exit_reason}): {self.symbol} | "
+                    f"P&L: {estimated_pnl:+.4f} USDT | R: {pnl_r:+.2f}",
+                    channel="trade"
+                )
+                trade_id = self._trade_ids.pop(self.symbol, None)
+                await self._reporter.report_trade_close(
+                    symbol=self.symbol,
+                    side=self._position_side.value if self._position_side else "long",
+                    exit_price=current_price,
+                    pnl_usdt=estimated_pnl,
+                    pnl_r=pnl_r,
+                    exit_reason=exit_reason,
+                    bars_held=self._bars_held,
+                    trade_id=trade_id,
+                )
+
             self._reset_position_state()
             self._cooldown_bars_remaining = self.COOLDOWN_BARS
             return False
@@ -676,15 +710,16 @@ class FuturesTrader:
                 open_trades=total_open,
                 atr=atr,
                 sl_atr_mult=regime_params.sl_mult,
-                tp_atr_mult=regime_params.tp_mult * 1.5,
+                tp_atr_mult=regime_params.tp_mult,   # no 1.5x stretch — keeps TP reachable within timeout
                 size_scale=regime_params.size_scale,
             )
 
             logger.info(
                 f"[TRADE_PARAMS] {self.symbol} {side.value.upper()} | "
                 f"SL={trade_params.stop_loss:.2f} ({regime_params.sl_mult:.2f}x ATR) | "
-                f"TP={trade_params.take_profit:.2f} ({regime_params.tp_mult * 1.5:.2f}x ATR) | "
-                f"Qty={trade_params.quantity:.4f} | Risk=${trade_params.risk_amount_usdt:.2f}"
+                f"TP={trade_params.take_profit:.2f} ({regime_params.tp_mult:.2f}x ATR) | "
+                f"Qty={trade_params.quantity:.4f} | Risk=${trade_params.risk_amount_usdt:.2f} | "
+                f"R:R={abs(trade_params.take_profit - trade_params.entry_price) / max(abs(trade_params.stop_loss - trade_params.entry_price), 1e-9):.2f}"
             )
             if not trade_params.approved:
                 logger.warning(f"[REJECTED] {self.symbol} — {trade_params.reject_reason}")
