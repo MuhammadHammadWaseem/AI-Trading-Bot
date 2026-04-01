@@ -632,14 +632,14 @@ class FuturesTrader:
             if prediction.confidence < eff_threshold:
                 logger.info(
                     f"[SKIP:CONF] {self.symbol} — "
-                    f"conf={prediction.confidence:.0%} < threshold={eff_threshold:.0%}"
+                    f"conf={prediction.confidence:.2%} < threshold={eff_threshold:.2%}"
                 )
                 if self._reporter:
                     direction = "LONG 📈" if side == OrderSide.LONG else "SHORT 📉"
                     self._reporter.queue_log(
                         "info",
                         f"🔍 {self.symbol} — {direction} signal seen but confidence too low "
-                        f"({prediction.confidence:.0%} < required {eff_threshold:.0%}). Skipped.",
+                        f"({prediction.confidence:.1%} < required {eff_threshold:.1%}). Skipped.",
                         channel="signal"
                     )
                 return

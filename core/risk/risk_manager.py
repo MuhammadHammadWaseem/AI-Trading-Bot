@@ -238,6 +238,35 @@ class RiskManager:
         if quantity <= 0:
             return self._reject(symbol, side, entry_price, "Calculated quantity is 0")
 
+        # ── Minimum notional enforcement (Binance USDM requires >= $100) ─────
+        # After floor-rounding, the actual notional (qty × price) can drop below
+        # the exchange minimum even when position_usdt is above it.
+        # e.g. BTC @ $68k: position_usdt=$124 → qty_raw=0.00181 → floored=0.001
+        #      actual_notional = 0.001 × $68k = $68 → exchange rejects with -4164
+        # Fix: bump qty up to the next step if notional is below the minimum.
+        # Only proceed if the bump is ≤ 2× the intended position (avoid silent risk creep).
+        MIN_BINANCE_NOTIONAL = 100.0
+        actual_notional = quantity * entry_price
+        if actual_notional < MIN_BINANCE_NOTIONAL:
+            # Step size is 3 decimal places for most symbols
+            step = 10 ** -3
+            min_qty = math.ceil(MIN_BINANCE_NOTIONAL / entry_price / step) * step
+            min_qty = round(min_qty, 3)
+            bumped_notional = min_qty * entry_price
+            oversize_ratio  = bumped_notional / position_usdt if position_usdt > 0 else 999
+            if oversize_ratio > 2.0:
+                return self._reject(
+                    symbol, side, entry_price,
+                    f"Notional too small: ${actual_notional:.2f} < ${MIN_BINANCE_NOTIONAL:.0f} minimum. "
+                    f"Bumping to min would require ${bumped_notional:.2f} ({oversize_ratio:.1f}× intended). "
+                    f"Increase balance or risk% to trade this symbol."
+                )
+            logger.info(
+                f"[MIN_NOTIONAL] {symbol} — qty bumped {quantity:.3f} → {min_qty:.3f} "
+                f"(notional: ${actual_notional:.2f} → ${bumped_notional:.2f}) to meet $100 minimum"
+            )
+            quantity = min_qty
+
         # ── ATR-based TP/SL ───────────────────────────────────────────────
         sl_m = sl_atr_mult or self.SL_ATR_MULT
         tp_m = tp_atr_mult or self.TP_ATR_MULT
