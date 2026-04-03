@@ -115,6 +115,8 @@ class FuturesTrader:
     MAX_CLOSE_RETRIES  = 3
     CLOSE_RETRY_DELAY  = 1.0   # seconds between retries
     SETTLE_DELAY       = 1.5   # seconds to wait after SL/TP/exit trigger
+    TAKER_FEE_RATE     = 0.0005  # 0.05% per side (Binance USDM standard taker fee)
+                                  # Update to 0.0002 if you have BNB fee discount or VIP tier
                                # before attempting close, to let the exchange
                                # settle its own fill.
 
@@ -203,6 +205,9 @@ class FuturesTrader:
         # Cumulative realized PnL from partial TP closes within this trade.
         # Needed so the final close reports combined PnL, not just remaining leg.
         self._partial_realized_pnl: float = 0.0
+        self._original_qty: float = 0.0          # full quantity at open (for fee calc)
+        self._last_qty: float = 0.0              # remaining qty (decreases after partial TP)
+        self._partial_exit_notional: float = 0.0 # sum of exit notionals from partial TPs
 
         # ── Cooldown ───────────────────────────────────────────────────────
         self._cooldown_bars_remaining = 0
@@ -412,6 +417,11 @@ class FuturesTrader:
                     channel="trade"
                 )
                 trade_id = self._trade_ids.pop(self.symbol, None)
+                est_fee  = (
+                    (self._entry_price or 0.0) * (self._original_qty or 0.0) +
+                    current_price * (self._last_qty or self._original_qty or 0.0) +
+                    self._partial_exit_notional
+                ) * self.TAKER_FEE_RATE
                 await self._reporter.report_trade_close(
                     symbol=self.symbol,
                     side=self._position_side.value if self._position_side else "long",
@@ -421,6 +431,7 @@ class FuturesTrader:
                     exit_reason=exit_reason,
                     bars_held=self._bars_held,
                     trade_id=trade_id,
+                    fee_usdt=round(est_fee, 4),
                 )
 
             self._reset_position_state()
@@ -884,7 +895,9 @@ class FuturesTrader:
                         (current_price - entry) * partial_qty if side == OrderSide.LONG
                         else (entry - current_price) * partial_qty
                     )
-                    self._partial_realized_pnl += partial_realized
+                    self._partial_realized_pnl  += partial_realized
+                    self._last_qty               = round(pos.quantity - partial_qty, 3)
+                    self._partial_exit_notional  += current_price * partial_qty
                     logger.info(f"[PARTIAL TP OK] {self.symbol} SL → breakeven {self._sl_price:.4f} | "
                                 f"partial_realized={partial_realized:+.4f} USDT")
                     if self._reporter:
@@ -987,8 +1000,11 @@ class FuturesTrader:
             # Freeze the original SL distance as the R-unit for this trade.
             # Position management (self._sl_price) and performance measurement
             # (R calculation) must never share the same mutable value.
-            self._original_sl_dist    = abs(result.price - params.stop_loss) or 1.0
-            self._partial_realized_pnl = 0.0
+            self._original_sl_dist      = abs(result.price - params.stop_loss) or 1.0
+            self._partial_realized_pnl  = 0.0
+            self._original_qty          = params.quantity
+            self._last_qty              = params.quantity
+            self._partial_exit_notional = 0.0
 
             if not self._sl_price or not self._tp_price:
                 logger.warning(
@@ -1061,6 +1077,21 @@ class FuturesTrader:
                 f"partial={self._partial_realized_pnl:+.4f} = total={combined_pnl:+.4f} USDT"
             )
             pnl = combined_pnl
+
+        # ── Compute round-trip trading fee ────────────────────────────────
+        # entry_notional uses _entry_price × original full quantity (before partial).
+        # exit_notional  uses current_price × remaining quantity.
+        # partial TP leg adds its own exit notional (entry already counted).
+        entry_notional   = (self._entry_price or 0.0) * (self._original_qty or 0.0)
+        exit_notional    = (current_price or 0.0) * (self._last_qty or 0.0)
+        partial_notional = self._partial_exit_notional  # accumulated during partial TP
+        fee_usdt = (entry_notional + exit_notional + partial_notional) * self.TAKER_FEE_RATE
+        net_pnl  = pnl - fee_usdt
+        logger.info(
+            f"[FEES] {self.symbol} — entry_notional=${entry_notional:.2f} | "
+            f"exit_notional=${exit_notional:.2f} | fee=${fee_usdt:.4f} | "
+            f"gross={pnl:+.4f} | net={net_pnl:+.4f} USDT"
+        )
         for attempt in range(1, self.MAX_CLOSE_RETRIES + 1):
             result = await self.exchange.close_position(self.symbol)
 
@@ -1093,6 +1124,7 @@ class FuturesTrader:
                         exit_reason=reason,
                         bars_held=self._bars_held,
                         trade_id=trade_id,
+                        fee_usdt=round(fee_usdt, 4),
                     )
 
                 self._reset_position_state()
@@ -1132,6 +1164,7 @@ class FuturesTrader:
                         symbol=self.symbol, side=self._position_side.value if self._position_side else "long",
                         exit_price=current_price or 0.0, pnl_usdt=pnl, pnl_r=pnl_r,
                         exit_reason=f"{reason}_EXTERNAL", bars_held=self._bars_held, trade_id=trade_id,
+                        fee_usdt=round(fee_usdt, 4),
                     )
                 self._reset_position_state()
                 self._cooldown_bars_remaining = self.COOLDOWN_BARS
@@ -1174,6 +1207,7 @@ class FuturesTrader:
                 symbol=self.symbol, side=self._position_side.value if self._position_side else "long",
                 exit_price=current_price or 0.0, pnl_usdt=pnl, pnl_r=pnl_r,
                 exit_reason=f"{reason}_SETTLEMENT", bars_held=self._bars_held, trade_id=trade_id,
+                fee_usdt=round(fee_usdt, 4),
             )
         self._reset_position_state()
         self._cooldown_bars_remaining = self.COOLDOWN_BARS
@@ -1214,8 +1248,11 @@ class FuturesTrader:
         self._last_known_pnl       = 0.0
         self._last_eval_time       = 0.0
         self._position_opened_at   = None
-        self._original_sl_dist     = 1.0
-        self._partial_realized_pnl = 0.0
+        self._original_sl_dist      = 1.0
+        self._partial_realized_pnl  = 0.0
+        self._original_qty          = 0.0
+        self._last_qty              = 0.0
+        self._partial_exit_notional = 0.0
 
     # ── Utilities ─────────────────────────────────────────────────────────
 

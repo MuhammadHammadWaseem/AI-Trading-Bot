@@ -209,6 +209,7 @@ class LaravelReporter:
         exit_reason: Optional[str] = None,
         bars_held: Optional[int] = None,
         trade_id: Optional[int] = None,
+        fee_usdt: Optional[float] = None,
     ):
         # Clamp pnl_r to ±9999 — extreme values (e.g. 1,166,999) indicate a
         # near-zero risk denominator and would overflow DECIMAL(12,4) in MySQL.
@@ -217,11 +218,19 @@ class LaravelReporter:
         if pnl_r is not None:
             safe_pnl_r = round(max(-9999.0, min(9999.0, float(pnl_r))), 4)
 
+        # net_pnl = gross PnL minus trading fees. Sent alongside pnl_usdt so
+        # the dashboard can display both gross and net figures.
+        net_pnl = None
+        if fee_usdt is not None:
+            net_pnl = round(float(pnl_usdt) - float(fee_usdt), 4)
+
         payload = {
             "trade_id": trade_id, "symbol": symbol, "side": side.lower(),
             "exit_price": exit_price, "pnl_usdt": round(float(pnl_usdt), 4),
             "pnl_r": safe_pnl_r,
             "exit_reason": exit_reason, "bars_held": bars_held,
+            "fee_usdt": round(float(fee_usdt), 4) if fee_usdt is not None else None,
+            "net_pnl":  net_pnl,
             "closed_at": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
         }
         resp = await self._post_safe("trade/close", payload)
