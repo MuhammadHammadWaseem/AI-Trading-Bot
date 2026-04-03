@@ -130,7 +130,7 @@ _REGIME_PARAMS = {
         "sl_mult_factor":      1.25,   # wider SL: 1.25× base (trend noise buffer)
         "tp_mult_factor":      1.20,   # modest TP expansion: 1.2× base only
         "position_size_scale": 0.80,   # slightly smaller size — trending = riskier
-        "early_profit_r":      0.60,   # hold a bit longer for trend to develop
+        "early_profit_r":      0.80,   # FIX: was 0.60 — higher floor so exit covers fees (need ~0.75R+ to net)
     },
     Regime.RANGE: {
         # Range: require stronger confirmation, take profit quickly
@@ -138,7 +138,7 @@ _REGIME_PARAMS = {
         "sl_mult_factor":      1.00,   # normal SL
         "tp_mult_factor":      1.00,   # normal TP — don't reach for large targets
         "position_size_scale": 1.00,   # normal size
-        "early_profit_r":      0.35,   # take profit faster before mean-reversion
+        "early_profit_r":      0.75,   # FIX: was 0.35 — raised to ensure gross > 2.5×fee before early exit
     },
     Regime.HIGH_VOLATILITY: {
         # High vol: widen SL to survive spikes, reduce size to limit loss
@@ -146,7 +146,7 @@ _REGIME_PARAMS = {
         "sl_mult_factor":      1.40,   # much wider SL: 1.4× base
         "tp_mult_factor":      1.10,   # only slightly wider TP
         "position_size_scale": 0.50,   # 50% of normal size (was 60%)
-        "early_profit_r":      0.40,   # take profits a bit faster in vol
+        "early_profit_r":      0.65,   # FIX: was 0.40 — raised; wide SL in HIGH_VOL means 0.40R gross is tiny
     },
 }
 

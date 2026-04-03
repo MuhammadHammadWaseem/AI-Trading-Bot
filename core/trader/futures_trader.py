@@ -96,18 +96,58 @@ class FuturesTrader:
     MAX_TRADE_DURATION_MINUTES: int = 60
 
     # ── Partial TP / trailing ─────────────────────────────────────────────
-    BREAKEVEN_TRIGGER_R  = 1.0
-    PARTIAL_TP_R         = 1.0
-    PARTIAL_TP_FRACTION  = 0.5
-    MIN_HOLD_BARS        = 2
+    # FIX (Flaw 3): Raised partial TP to 1.5R (was 1.0R), fraction to 25%
+    # (was 50%). Locking in profit at 1.0R on 50% was de facto capping the
+    # entire trade at 1.0R and destroying the R:R advantage of the 3.0R TP.
+    BREAKEVEN_TRIGGER_R  = 1.5   # was 1.0 — only move SL after solid gain
+    PARTIAL_TP_R         = 1.5   # was 1.0 — wait for real momentum before locking
+    PARTIAL_TP_FRACTION  = 0.25  # was 0.5 — lock only 25%, preserve 75% for TP
+    MIN_HOLD_BARS        = 3     # was 2 — need at least 3 bars before any exit logic
 
-    # ── Volatility gate ───────────────────────────────────────────────────
-    ATR_RATIO_MIN = 0.90
+    # ── Volatility / market readiness gates ──────────────────────────────
+    ATR_RATIO_MIN  = 0.90   # current ATR must be >= 90% of rolling mean
+    ATR_RATIO_MAX  = 2.50   # reject extreme spike volatility (news/liquidation)
+    ADX_MIN        = 16.0   # minimum ADX for any trade — below = directionless
+    # Minimum recent directional momentum: price must have moved at least this
+    # fraction of ATR in the signal direction over the last 3 bars.
+    MIN_MOMENTUM_RATIO = 0.25  # close[-1] vs close[-4] must be >= 0.25 × ATR
+
+    # ── Profitability gate (Flaw 6) ───────────────────────────────────────
+    # Minimum gross P&L headroom as a multiple of the roundtrip fee.
+    # Expected gross = ATR × sl_mult × qty. If this < MIN_FEE_MULTIPLE × fee,
+    # the trade cannot produce net profit even with a favorable outcome.
+    MIN_FEE_MULTIPLE   = 2.5   # expected_gross must be >= 2.5 × roundtrip_fee
 
     # ── Confidence ────────────────────────────────────────────────────────
     BASE_THRESHOLD = 0.55
     SPLIT_MIN_CONF = 0.52
     RECALIB_CAP    = 0.08
+
+    # ── Directional loss streak suppression (Flaw 7) ─────────────────────
+    # After this many consecutive losses in the same direction, block that
+    # direction for STREAK_COOLDOWN_BARS before allowing re-entry.
+    MAX_DIRECTION_LOSSES = 3
+    STREAK_COOLDOWN_BARS = 8   # ~40 min at 5m bars
+
+    # ── Variable cooldown by exit reason (Flaw 5) ─────────────────────────
+    COOLDOWN_BY_REASON: dict = {
+        "SL":               5,   # market moved against us — wait longer
+        "TIMEOUT":          2,   # neutral — re-evaluate sooner
+        "STALL":            1,   # stalled early — exit and look for new setup immediately
+        "EARLY_PROFIT":     2,   # momentum trade — can re-enter quickly
+        "TP":               2,   # full TP — quick reset
+        "REVERSAL":         3,   # signal reversed — standard wait
+        "HARD_TIMEOUT":     3,
+        "EXTERNALLY_CLOSED":3,
+        "default":          3,   # fallback for any other reason
+    }
+    COOLDOWN_BARS = 3   # kept for backward compat (used as fallback above)
+
+    # ── Early profit (Flaw 1): fee-aware minimum ──────────────────────────
+    # Regime early_profit_r from regime_detector is still the TRIGGER.
+    # But an early exit is ALSO gated by: gross_pnl >= fee × MIN_FEE_MULTIPLE.
+    # If gross is below that floor, we hold despite meeting early_r criteria.
+    # early_r is intentionally kept in regime_detector for flexibility.
 
     # ── Close reliability ─────────────────────────────────────────────────
     # How many times to retry a close before giving up and letting the
@@ -208,6 +248,15 @@ class FuturesTrader:
         self._original_qty: float = 0.0          # full quantity at open (for fee calc)
         self._last_qty: float = 0.0              # remaining qty (decreases after partial TP)
         self._partial_exit_notional: float = 0.0 # sum of exit notionals from partial TPs
+
+        # ── Directional streak tracking (Flaw 7 fix) ─────────────────────
+        # Count consecutive losses per direction. Once MAX_DIRECTION_LOSSES
+        # is hit, that direction is suppressed for STREAK_COOLDOWN_BARS bars.
+        self._loss_streak: dict = {"long": 0, "short": 0}
+        self._direction_suppressed_bars: dict = {"long": 0, "short": 0}
+
+        # ── Last exit reason (for variable cooldown, Flaw 5 fix) ──────────
+        self._last_exit_reason: str = "default"
 
         # ── Cooldown ───────────────────────────────────────────────────────
         self._cooldown_bars_remaining = 0
@@ -594,28 +643,54 @@ class FuturesTrader:
                     )
                 return
 
-            # ── Volatility gate ───────────────────────────────────────────
+            # ── Market readiness gate (Flaw 4 fix: multi-factor) ─────────
             atr_ratio = 0.0
+            atr_cur   = 0.0
+            adx_cur   = 0.0
             if "atr" in df.columns:
                 atr_s = df["atr"].dropna()
                 if len(atr_s) >= 20:
                     atr_cur   = float(atr_s.iloc[-1])
                     atr_mean  = float(atr_s.rolling(20).mean().iloc[-1])
                     atr_ratio = atr_cur / atr_mean if atr_mean > 0 else 1.0
-                    if atr_ratio < self.ATR_RATIO_MIN:
-                        logger.info(
-                            f"[SKIP:LOW_VOL] {self.symbol} — "
-                            f"ATR_ratio={atr_ratio:.2f} < {self.ATR_RATIO_MIN:.2f}"
-                        )
-                        if self._reporter:
-                            self._reporter.queue_log(
-                                "info",
-                                f"📉 {self.symbol} — Market too quiet (volatility {atr_ratio:.0%} of average). "
-                                f"Waiting for a better setup.",
-                                channel="signal"
-                            )
-                        self._last_eval_time = time.monotonic()
-                        return
+            if "adx" in df.columns:
+                adx_cur = float(df["adx"].dropna().iloc[-1]) if len(df["adx"].dropna()) > 0 else 0.0
+
+            # Gate 1: Absolute volatility bounds
+            skip_reason = None
+            if atr_ratio < self.ATR_RATIO_MIN:
+                skip_reason = f"too quiet (ATR_ratio={atr_ratio:.2f} < {self.ATR_RATIO_MIN})"
+            elif atr_ratio > self.ATR_RATIO_MAX:
+                skip_reason = f"extreme spike (ATR_ratio={atr_ratio:.2f} > {self.ATR_RATIO_MAX}) — likely news/liquidation"
+
+            # Gate 2: ADX floor — no trade in directionless markets
+            if skip_reason is None and adx_cur > 0 and adx_cur < self.ADX_MIN:
+                skip_reason = f"ADX too low ({adx_cur:.1f} < {self.ADX_MIN}) — market has no trend structure"
+
+            # Gate 3: Momentum check — has price actually moved recently?
+            if skip_reason is None and atr_cur > 0 and len(df) >= 4:
+                recent_move = abs(float(df["close"].iloc[-1]) - float(df["close"].iloc[-4]))
+                if recent_move < self.MIN_MOMENTUM_RATIO * atr_cur:
+                    skip_reason = (f"no momentum (3-bar move={recent_move:.4f} < "
+                                   f"{self.MIN_MOMENTUM_RATIO}×ATR={self.MIN_MOMENTUM_RATIO*atr_cur:.4f})")
+
+            if skip_reason:
+                logger.info(f"[SKIP:MARKET] {self.symbol} — {skip_reason}")
+                if self._reporter:
+                    self._reporter.queue_log(
+                        "info",
+                        f"📉 {self.symbol} — Market not ready: {skip_reason}. Waiting.",
+                        channel="signal"
+                    )
+                self._last_eval_time = time.monotonic()
+                return
+
+            # ── FIX 7: Directional streak suppression ─────────────────────
+            # Decrement suppression counters each new 5m bar
+            if new_5m_candle:
+                for d in ("long", "short"):
+                    if self._direction_suppressed_bars.get(d, 0) > 0:
+                        self._direction_suppressed_bars[d] -= 1
 
             # ── Signal evaluation ─────────────────────────────────────────
             prediction = self.model.predict(df, df_1h=df_1h)
@@ -748,6 +823,48 @@ class FuturesTrader:
                         channel="bot"
                     )
                 return
+
+            # ── FIX 7: Directional streak check ──────────────────────────
+            side_key = side.value.lower()
+            if self._direction_suppressed_bars.get(side_key, 0) > 0:
+                remaining = self._direction_suppressed_bars[side_key]
+                logger.info(
+                    f"[SKIP:STREAK] {self.symbol} — {side_key.upper()} suppressed, "
+                    f"{remaining} bars remaining after consecutive losses."
+                )
+                if self._reporter:
+                    self._reporter.queue_log(
+                        "info",
+                        f"🚫 {self.symbol} — {side_key.upper()} direction paused after "
+                        f"{self.MAX_DIRECTION_LOSSES} consecutive losses. "
+                        f"{remaining} bars before re-enabling.",
+                        channel="signal"
+                    )
+                return
+
+            # ── FIX 6: Profitability gate ─────────────────────────────────
+            # Ensure the expected gross P&L at entry justifies the fee cost.
+            # Without this, ATR environments with small absolute moves generate
+            # trades whose best-case gross is below the minimum viable profit.
+            if atr_cur > 0 and trade_params.quantity > 0:
+                sl_dist_approx   = abs(trade_params.entry_price - trade_params.stop_loss)
+                expected_gross   = sl_dist_approx * trade_params.quantity * regime_params.tp_mult / regime_params.sl_mult
+                roundtrip_fee    = trade_params.entry_price * trade_params.quantity * self.TAKER_FEE_RATE * 2
+                if expected_gross < roundtrip_fee * self.MIN_FEE_MULTIPLE:
+                    logger.info(
+                        f"[SKIP:PAYOFF] {self.symbol} — expected_gross=${expected_gross:.4f} < "
+                        f"{self.MIN_FEE_MULTIPLE}×fee=${roundtrip_fee*self.MIN_FEE_MULTIPLE:.4f}. "
+                        f"Trade cannot net profit at this position size."
+                    )
+                    if self._reporter:
+                        self._reporter.queue_log(
+                            "info",
+                            f"📊 {self.symbol} — Trade skipped: expected payoff (${expected_gross:.2f}) "
+                            f"is too small relative to fees (${roundtrip_fee:.2f} roundtrip). "
+                            f"Increase position size or wait for higher-ATR conditions.",
+                            channel="signal"
+                        )
+                    return
 
             if self.recovery.is_in_recovery(self.symbol):
                 if self.recovery.should_open_recovery(self.symbol, prediction):
@@ -925,17 +1042,62 @@ class FuturesTrader:
                         f"🛡️ {self.symbol} — Stop loss moved to breakeven at {new_sl:.4f}. Position is now risk-free.",
                         channel="trade")
 
-        # ── Early profit exit ─────────────────────────────────────────────
+        # ── Early profit exit (Flaw 1 fix: fee-aware minimum gross) ────────
         early_r = regime_params.early_profit_r
         if (
             self._bars_held >= self.MIN_HOLD_BARS
             and current_r >= early_r
             and not self._partial_exit_taken
         ):
-            logger.info(f"[EARLY PROFIT] {self.symbol} R={current_r:+.2f} >= {early_r:.2f}R")
+            # Gate: only exit early if gross PnL is a meaningful multiple of fees.
+            # Exiting at 0.35R with a gross of $0.37 and fee of $0.25 leaves $0.12
+            # net — any slippage makes it a net loss. Hold until gross >= 2.5× fee.
+            roundtrip_fee      = (self._entry_price or 0.0) * (self._original_qty or 0.0) * self.TAKER_FEE_RATE * 2
+            current_gross      = abs(pos.unrealized_pnl) if pos.unrealized_pnl is not None else 0.0
+            fee_multiple_gross = (current_gross / roundtrip_fee) if roundtrip_fee > 0 else 99.0
+
+            if fee_multiple_gross >= self.MIN_FEE_MULTIPLE:
+                logger.info(
+                    f"[EARLY PROFIT] {self.symbol} R={current_r:+.2f} | "
+                    f"gross={current_gross:.4f} ({fee_multiple_gross:.1f}×fee) — exiting."
+                )
+                await asyncio.sleep(self.SETTLE_DELAY)
+                await self._close_with_retry(
+                    "EARLY_PROFIT", pos.unrealized_pnl, current_r, regime_params, current_price
+                )
+                return
+            else:
+                logger.info(
+                    f"[EARLY HOLD] {self.symbol} R={current_r:+.2f} >= {early_r:.2f}R but "
+                    f"gross={current_gross:.4f} only {fee_multiple_gross:.1f}×fee "
+                    f"(need {self.MIN_FEE_MULTIPLE}×). Holding for TP."
+                )
+
+        # ── Momentum stall check (Flaw 2 fix) ────────────────────────────
+        # After MIN_HOLD_BARS+1, if price has not moved at least MIN_MOMENTUM_RATIO
+        # toward TP, the trade is stalling. A stalling trade most likely times out
+        # (expected PnL ≈ 0, but fee is always charged). Exit now at a small loss
+        # rather than paying full time cost for an already-dead trade.
+        # Not applied if partial TP taken (SL already at breakeven = risk-free).
+        if (
+            not self._partial_exit_taken
+            and self._bars_held == self.MIN_HOLD_BARS + 1
+            and 0.0 <= current_r < self.MIN_MOMENTUM_RATIO
+        ):
+            logger.info(
+                f"[STALL] {self.symbol} — R={current_r:+.2f} after {self._bars_held} bars. "
+                f"No momentum toward TP. Exiting to free capital."
+            )
+            if self._reporter:
+                self._reporter.queue_log(
+                    "info",
+                    f"⏱️ {self.symbol} — Trade has not developed after {self._bars_held} bars "
+                    f"(R={current_r:+.2f}). Closing to avoid timeout fee drain.",
+                    channel="trade"
+                )
             await asyncio.sleep(self.SETTLE_DELAY)
             await self._close_with_retry(
-                "EARLY_PROFIT", pos.unrealized_pnl, current_r, regime_params, current_price
+                "STALL", pos.unrealized_pnl, current_r, regime_params, current_price
             )
             return
 
@@ -1233,6 +1395,27 @@ class FuturesTrader:
             regime=regime_name,
         )
 
+        # ── FIX 5: Set variable cooldown based on exit reason ────────────
+        base_reason = exit_reason.replace("_EXTERNAL", "").replace("_SETTLEMENT", "")
+        self._last_exit_reason   = base_reason
+        self._cooldown_bars_remaining = self.COOLDOWN_BY_REASON.get(
+            base_reason, self.COOLDOWN_BY_REASON["default"]
+        )
+        # FIX 7: Update directional loss streak
+        side_key = (self._position_side.value if self._position_side else "").lower()
+        if side_key in ("long", "short"):
+            if pnl < 0:
+                self._loss_streak[side_key] = self._loss_streak.get(side_key, 0) + 1
+                if self._loss_streak[side_key] >= self.MAX_DIRECTION_LOSSES:
+                    self._direction_suppressed_bars[side_key] = self.STREAK_COOLDOWN_BARS
+                    logger.warning(
+                        f"[STREAK] {self.symbol} — {side_key.upper()} suppressed for "
+                        f"{self.STREAK_COOLDOWN_BARS} bars after {self._loss_streak[side_key]} "
+                        f"consecutive losses."
+                    )
+            else:
+                self._loss_streak[side_key] = 0   # reset on win
+
     # ── State reset ───────────────────────────────────────────────────────
 
     def _reset_position_state(self):
@@ -1253,6 +1436,9 @@ class FuturesTrader:
         self._original_qty          = 0.0
         self._last_qty              = 0.0
         self._partial_exit_notional = 0.0
+        # Note: _loss_streak and _direction_suppressed_bars are NOT reset here.
+        # They persist across trades — that is intentional; they track cross-trade
+        # patterns and should survive individual trade resets.
 
     # ── Utilities ─────────────────────────────────────────────────────────
 
