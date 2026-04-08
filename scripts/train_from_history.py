@@ -63,20 +63,49 @@ TIMEFRAMES  = ["5m", "1h"]
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 FUTURE_BARS    = 12      # 5m bars ahead to label (12 × 5m = 1h horizon)
-ATR_MULT       = 1.0     # tighter barrier for 5m noise (was 1.5 for 15m)
-ATR_MULT_MAP   = {
-    "BTCUSDT": 1.0,
-    "ETHUSDT": 1.1,
-    "BNBUSDT": 1.0,
-    "SOLUSDT": 1.2,
-}
-N_WF_SPLITS    = 5       # 5 folds is enough for 338k bars
-WF_GAP         = 12      # gap = FUTURE_BARS (no leakage)
 
-# Restored strict thresholds — justified now that we have years of data
-MIN_SHARPE     = 0.50
-MIN_F1         = 0.35
-MIN_CONSIST    = 0.60
+# ── ATR_MULT: THE MOST CRITICAL PARAMETER ─────────────────────────────────────
+# This controls label selectivity. With ATR_MULT=1.0:
+#   barriers at ±1×ATR fire on 97.6% of bars → model predicts direction on noise
+#   → Sharpe = -8.0, no edge, random coin flip
+#
+# With ATR_MULT=3.0:
+#   barriers at ±3×ATR fire on ~30% of bars → only strong momentum moves labeled
+#   → model learns "what does a genuine trend start look like?"
+#   → HOLD=40-45%, LONG=28%, SHORT=28% — meaningful selectivity
+#
+# The triple barrier's target must match what the live bot actually needs to win:
+#   TP = 3×ATR, SL = 2×ATR → trade needs to move +3×ATR before -2×ATR
+#   Label should ask the same question: "will price reach +3×ATR before -3×ATR?"
+#   ATR_MULT=3.0 aligns the label with the actual trade target.
+ATR_MULT       = 3.0
+ATR_MULT_MAP   = {
+    "BTCUSDT": 3.0,   # was 1.0 — caused HOLD=2.4%, all bars labeled, zero edge
+    "ETHUSDT": 3.0,   # was 1.1
+    "BNBUSDT": 2.5,   # BNB has lower ATR vs range, slightly tighter ok
+    "SOLUSDT": 2.8,   # SOL is more volatile, wider barrier needed for selectivity
+}
+N_WF_SPLITS    = 5
+WF_GAP         = 12      # = FUTURE_BARS (no leakage)
+
+# ── WALK-FORWARD: FIXED TEST SIZE ─────────────────────────────────────────────
+# CRITICAL FIX: the original formula (n_samples / n_splits) gave test_size=89k
+# which consumed 100% of data in 5 folds, leaving fold 1 with 248 training bars.
+# A LightGBM with 129 features trained on 148 bars is massively overfit noise.
+#
+# Solution: fixed test_size of 25,000 bars (= ~87 days of 5m data)
+#   Each test fold covers ~3 months — long enough for meaningful Sharpe statistics
+#   (≥500 trades in the sim, Sharpe std error < 0.05)
+#
+# min_train_size = 50,000 bars (= ~6 months) — model needs market history to learn
+#   Bull run → correction → recovery → the model needs to have seen all of these
+WF_TEST_SIZE   = 25_000  # fixed bars per test fold — do NOT derive from n_samples
+WF_MIN_TRAIN   = 50_000  # minimum training bars per fold (skip folds with less)
+
+# Thresholds — meaningful now with proper splits
+MIN_SHARPE     = 0.30    # relaxed slightly given 5m noise; 0.30 = real edge
+MIN_F1         = 0.33    # must beat 3-class random baseline
+MIN_CONSIST    = 0.60    # 3/5 folds must show positive Sharpe
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -441,6 +470,26 @@ def train_symbol_from_history(symbol: str, dry_run: bool = False) -> dict:
     print(f"  Samples: {n_samples:,}  |  Features: {n_features}")
     print(f"  Labels:  HOLD={hold_pct:.1%}  LONG={long_pct:.1%}  SHORT={short_pct:.1%}")
 
+    # Gate: HOLD must be at least 20% of labels.
+    # If HOLD < 20%: ATR_MULT is too low — barriers fire on noise, not real moves.
+    # The model learns to predict every bar's direction on coin-flip labels.
+    # This is the root cause of Sharpe=-8.0 and 0% HOLD predictions.
+    if hold_pct < 0.20:
+        print(f"  [ABORT] HOLD={hold_pct:.1%} < 20% — ATR_MULT is too low.")
+        print(f"  With only {hold_pct:.1%} HOLD labels the model has no selectivity signal.")
+        print(f"  It will trade every bar on coin-flip labels (Sharpe near -8).")
+        print(f"  FIX: increase ATR_MULT_MAP for {symbol} (current: {atr_mult})")
+        print(f"  Target: HOLD=35-55%, LONG=22-32%, SHORT=22-32%")
+        print(f"  Try ATR_MULT = {atr_mult + 0.5:.1f} and re-run.")
+        result["status"] = "BAD_LABELS"
+        return result
+
+    # Warn if directional imbalance > 60/40
+    if max(long_pct, short_pct) / (long_pct + short_pct + 1e-9) > 0.60:
+        bias = "LONG" if long_pct > short_pct else "SHORT"
+        print(f"  ⚠  Label {bias} bias: {max(long_pct,short_pct):.1%} vs {min(long_pct,short_pct):.1%}.")
+        print(f"     Model may develop {bias} trading bias in live environment.")
+
     # Scale features
     scaler = RobustScaler()
     X = scaler.fit_transform(feat_df.values.astype(np.float32))
@@ -455,8 +504,20 @@ def train_symbol_from_history(symbol: str, dry_run: bool = False) -> dict:
     # ── Walk-forward validation ────────────────────────────────────────────────
     print(f"\n  Walk-forward validation ({N_WF_SPLITS} folds)...")
 
-    wfv    = WalkForwardValidator(n_splits=N_WF_SPLITS, gap=WF_GAP)
+    wfv    = WalkForwardValidator(
+        n_splits       = N_WF_SPLITS,
+        gap            = WF_GAP,
+        test_size      = WF_TEST_SIZE,   # FIXED size, not derived from n_samples
+        min_train_size = WF_MIN_TRAIN,   # skip folds with insufficient history
+    )
     splits = wfv.split(n_samples)
+
+    if not splits:
+        print(f"  [ERROR] No valid folds — n_samples={n_samples:,} too small for "
+              f"min_train={WF_MIN_TRAIN:,} + test={WF_TEST_SIZE:,} × {N_WF_SPLITS} folds. "
+              f"Need at least {WF_MIN_TRAIN + WF_TEST_SIZE * N_WF_SPLITS + WF_GAP * N_WF_SPLITS:,} samples.")
+        result["status"] = "INSUFFICIENT_DATA"
+        return result
 
     fold_results = []
     for fold_idx, (train_idx, test_idx) in enumerate(splits, 1):

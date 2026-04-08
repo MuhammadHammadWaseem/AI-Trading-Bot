@@ -150,11 +150,18 @@ _REGIME_PARAMS = {
     },
 }
 
-# In TRENDING regime, REQUIRE_AGREEMENT is enforced unconditionally regardless
-# of the trader's global REQUIRE_AGREEMENT setting. This prevents SPLIT signals
-# from slipping through just because ADX is high.
-# Set False only for research purposes.
-TRENDING_REQUIRE_AGREE = True
+# TRENDING_REQUIRE_AGREE controls whether TRENDING regime requires both models
+# to agree before entering a trade.
+#
+# Previously True, but this combined with the removal of confidence scaling
+# made TRENDING effectively non-tradeable: the blended confidence ceiling
+# with raw (unscaled) outputs is ~0.77, and TRENDING threshold is 0.75.
+# An AGREE signal at ML=60% + TA=100% gives blended=0.74 — still below threshold.
+#
+# With require_agree=False, a SPLIT signal can trade if conf ≥ threshold (0.68-0.75).
+# The ML precision of 60% provides the same quality gate as AGREE did,
+# without requiring the coincidence of two independent models signaling together.
+TRENDING_REQUIRE_AGREE = False
 
 # ── Detection thresholds ──────────────────────────────────────────────────────
 

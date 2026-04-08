@@ -179,6 +179,7 @@ class MLModel(BaseModel):
         self._models:        list      = []
         self._scaler:        Optional[RobustScaler] = None
         self._is_trained:    bool      = False
+        self._wf_accepted:   bool      = False   # only True if walk-forward passed
         self._feature_names: List[str] = []
         self._try_load()
 
@@ -197,6 +198,16 @@ class MLModel(BaseModel):
                 signal=Signal.HOLD, confidence=0.0,
                 long_probability=0.33, short_probability=0.33,
                 source="ml", reasoning="Model not trained",
+            )
+        if not self._wf_accepted:
+            # FIX Bug 2: WF-rejected models must not generate directional signals.
+            # Return neutral probabilities — the hybrid model will fall back to
+            # TechnicalModel-only mode, which at least doesn't have the ML's
+            # training-data biases baked in.
+            return PredictionResult(
+                signal=Signal.HOLD, confidence=0.0,
+                long_probability=0.33, short_probability=0.33,
+                source="ml", reasoning="WF-REJECTED: model disabled until retrained with more data",
             )
         try:
             # Build features matching training
@@ -270,11 +281,20 @@ class MLModel(BaseModel):
                 f"{len(self._feature_names)} features"
             )
             if not accepted:
+                # FIX Bug 2: Do NOT use a WF-rejected model for directional trading.
+                # A model that failed walk-forward validation has no proven edge.
+                # Previously this was silently used for live trades — that caused
+                # all 10 trades in the audit dataset to lose money.
+                # Now: rejected model is loaded but flagged; predict() returns HOLD.
+                self._wf_accepted = False
                 logger.warning(
-                    f"[ML] {self.symbol} WF-REJECTED but saved anyway (bot needs a model) | "
+                    f"[ML] {self.symbol} WF-REJECTED — model loaded but DISABLED for live trading. "
                     f"Sharpe={wf_sharpe:.2f}  F1={wf_f1:.3f} | "
-                    f"Path: {self._model_path}"
+                    f"Bot will use TechnicalModel only until model passes validation. "
+                    f"Retrain with more data to enable ML signals."
                 )
+            else:
+                self._wf_accepted = True
         except Exception as e:
             logger.warning(f"Could not load model {self.symbol}: {e}")
 

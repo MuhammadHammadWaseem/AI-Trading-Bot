@@ -106,12 +106,21 @@ class WalkForwardValidator:
     """
 
     # Model acceptance thresholds
-    # NOTE: With only ~1300 bars (13 days testnet), strict thresholds are unreachable.
-    # These are intentionally relaxed for limited-data environments.
-    # On live data with 3000+ bars, tighten these back to 0.50 / 0.35 / 0.60
-    MIN_SHARPE       = 0.00   # any positive Sharpe is acceptable with limited data
-    MIN_F1_MACRO     = 0.25   # relaxed: 3-class random baseline is 0.33, we just need signal
-    MIN_CONSISTENCY  = 0.40   # 2/5 folds positive is acceptable for 13 days of data
+    # These were previously set near-zero ("relaxed for testnet data") which meant
+    # random models passed validation and were deployed to live trading.
+    # A model with MIN_SHARPE=0.00 and MIN_F1=0.25 (below random 0.33 baseline)
+    # has NO demonstrated edge. Deploying it is equivalent to trading randomly.
+    #
+    # These thresholds are now set to require genuine predictive signal:
+    #   - Sharpe > 0.30: modest but real risk-adjusted returns across folds
+    #   - F1 > 0.33: must beat 3-class random baseline (not just approach it)
+    #   - Consistency > 0.60: majority of folds must show positive Sharpe
+    #
+    # If your model can't pass these with your training data, DO NOT TRADE.
+    # Collect more data or fix the training pipeline first.
+    MIN_SHARPE       = 0.30   # was 0.00 — requires real risk-adjusted edge
+    MIN_F1_MACRO     = 0.33   # was 0.25 — must beat random baseline (3-class = 0.33)
+    MIN_CONSISTENCY  = 0.60   # was 0.40 — majority of folds must be profitable
 
     def __init__(
         self,
@@ -133,16 +142,30 @@ class WalkForwardValidator:
         """
         Generate (train_indices, test_indices) for each fold.
 
-        Example with n=1000, n_splits=5, gap=8:
-          Fold 0: train=[0:600],   test=[608:680]
-          Fold 1: train=[0:680],   test=[688:760]
-          Fold 2: train=[0:760],   test=[768:840]
-          Fold 3: train=[0:840],   test=[848:920]
-          Fold 4: train=[0:920],   test=[928:1000]
+        CRITICAL CHANGE: When test_size is explicitly provided (recommended for
+        large datasets), use it directly. Do NOT derive test_size from n_samples.
+
+        The old formula: test_sz = (n - min_train - gap*splits) / splits
+        With n=447k and splits=5, this gives test_sz=89k — consuming ~100% of data
+        in test windows and leaving fold 1 with only 248 training bars.
+
+        Use test_size=25_000 (fixed) to ensure:
+          - Each test fold covers ~87 days (statistically meaningful)
+          - Fold 1 always gets min_train_size bars of warmup
+          - Results are comparable across different dataset sizes
+
+        Example with n=447k, test_size=25k, min_train=50k, gap=12:
+          Fold 1: train=[0:322,123]  test=[322,135:347,135]  (50k+ train, 25k test)
+          Fold 2: train=[0:347,123]  test=[347,135:372,135]
+          ...
+          Fold 5: train=[0:422,123]  test=[422,135:447,135]
         """
-        test_sz = self.test_size or max(
-            50, (n_samples - self.min_train_size - self.gap * self.n_splits) // self.n_splits
-        )
+        if self.test_size is not None:
+            # PREFERRED: explicit fixed test size — use as-is
+            test_sz = self.test_size
+        else:
+            # Legacy auto-compute — only valid for small datasets (<10k samples)
+            test_sz = max(50, (n_samples - self.min_train_size - self.gap * self.n_splits) // self.n_splits)
 
         splits = []
         test_end = n_samples
@@ -156,8 +179,12 @@ class WalkForwardValidator:
             else:
                 train_start = 0
 
-            if train_end - train_start < self.min_train_size:
-                break  # not enough training data
+            # Strict min_train_size enforcement — skip folds with insufficient history
+            actual_train = train_end - train_start
+            if actual_train < self.min_train_size:
+                # Don't break — keep checking earlier folds (they have even less data)
+                # For expanding window, this will always be the earliest fold
+                break
 
             train_idx = np.arange(train_start, train_end)
             test_idx  = np.arange(test_start, test_end)
@@ -333,15 +360,19 @@ def _compute_classification_metrics(fold: FoldResult) -> FoldResult:
 def _compute_trading_metrics(
     y_pred: np.ndarray,
     prices: np.ndarray,
-    fee_pct: float = 0.0004,
-    slippage: float = 0.0002,
-    tp_mult: float = 0.008,   # 0.8% TP — calibrated for 5m (1h horizon)
-    sl_mult: float = 0.004,   # 0.4% SL — half of TP gives 2:1 R:R
-    max_hold_bars: int = 12,  # max 12 bars = 1 hour at 5m
+    fee_pct:       float = 0.0005,   # 0.05% taker (was 0.04% — use actual rate)
+    slippage:      float = 0.0002,
+    tp_mult:       float = 0.0063,   # ~3.0× ATR; ETH ATR/price ≈ 0.21% → 3×ATR=0.63%
+    sl_mult:       float = 0.0042,   # ~2.0× ATR; sl_mult = tp_mult / 1.5 for 1.5 R:R
+    max_hold_bars: int   = 10,       # matches live TRENDING timeout (was 12)
 ) -> dict:
     """
-    PnL simulation with TP/SL exits and max hold limit.
-    Calibrated for 5m candles (0.8% TP, 0.4% SL, 12-bar max hold).
+    PnL simulation aligned with live bot parameters.
+
+    Previously used tp=0.8%, sl=0.4% (2:1 R:R) which differed from the live
+    bot (tp≈0.63%, sl≈0.42%, R:R≈1.5). A model validated on 2:1 R:R may have
+    zero edge at 1.5:1 R:R. Backtester must match live parameters or the
+    walk-forward Sharpe has no predictive value for live performance.
     """
     returns = []
     in_position = 0

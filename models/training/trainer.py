@@ -157,10 +157,16 @@ class ModelTrainer:
     """
 
     LABEL_METHOD   = "triple_barrier"
-    FUTURE_BARS    = 8
-    ATR_MULT       = 1.5
+    # FIX Bug 3: Align training horizon with live bot trading horizon.
+    # Previously: FUTURE_BARS=8 (40 min), ATR_MULT=1.5 (label fires at 1.5×ATR).
+    # Live bot: SL=2.0×ATR, TP=3.0×ATR, TIMEOUT=10 bars (50 min).
+    # The model was trained to predict a 1.5×ATR move in 8 bars, but the live
+    # trade requires a 3.0×ATR move in 10 bars — a completely different task.
+    # Fix: train with same ATR target and time horizon as the live trade.
+    FUTURE_BARS    = 10     # was 8 — matches TRENDING timeout
+    ATR_MULT       = 2.0    # was 1.5 — label fires when SL would be hit (2×ATR)
     N_WF_SPLITS    = 5
-    WF_GAP         = 8      # = FUTURE_BARS to prevent label leakage
+    WF_GAP         = 10     # was 8 — = FUTURE_BARS to prevent label leakage
 
     def __init__(self, symbol: str = "BTCUSDT", model_dir: Path = None):
         self.symbol    = symbol.replace("/", "")
@@ -206,6 +212,27 @@ class ModelTrainer:
 
         if len(X) < 500:
             logger.warning("[TRAINER] Too few samples for reliable training (< 500)")
+
+        # Hard stop: do not train on insufficient data. The walk-forward
+        # validator needs at least min_train_size × n_splits + gap bars.
+        # With 5 folds, 300 min_train, 10 gap: need ≥ ~1700 samples.
+        # Less than this and the walk-forward folds are too small to be meaningful.
+        MIN_SAMPLES_FOR_WF = 800
+        if len(X) < MIN_SAMPLES_FOR_WF:
+            from dataclasses import asdict
+            logger.error(
+                f"[TRAINER] INSUFFICIENT DATA: {len(X)} samples < {MIN_SAMPLES_FOR_WF} minimum. "
+                f"Collect at least {MIN_SAMPLES_FOR_WF} bars of 5m data before training. "
+                f"At 5m candles: {MIN_SAMPLES_FOR_WF} bars = {MIN_SAMPLES_FOR_WF*5/60:.0f} hours of data."
+            )
+            # Return a rejected result — do not save this model
+            return TrainingResult(
+                symbol=self.symbol, accepted=False, model=[],
+                scaler=RobustScaler(), feature_names=[],
+                wf_sharpe=-999.0, wf_f1=0.0, wf_consistency=0.0,
+                val_accuracy=0.0, val_report="INSUFFICIENT DATA",
+                label_dist=dist,
+            )
 
         # ── 3. Walk-Forward Validation ────────────────────────────────────
         prices = df["close"].values[valid_mask.values][: -self.FUTURE_BARS] \

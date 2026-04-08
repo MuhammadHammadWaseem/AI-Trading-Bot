@@ -43,14 +43,18 @@ class TechnicalModel(BaseModel):
 
         # ── 1. RSI ──────────────────────────────────────────────────────────
         rsi = row.get("rsi", 50)
+        # FIX Bug 4: RSI 55-70 is a BULLISH zone in trending markets, not SHORT.
+        # Previous code voted SHORT whenever RSI > 55, creating permanent SHORT bias
+        # during uptrends where RSI naturally stays elevated at 55-70.
+        # Now: only RSI > 70 (overbought) is a SHORT signal; 55-70 = LONG bias (momentum).
         if rsi < 30:
             votes.append(("rsi", 1.5, "RSI oversold → LONG"))
         elif rsi > 70:
             votes.append(("rsi", -1.5, "RSI overbought → SHORT"))
         elif rsi < 45:
-            votes.append(("rsi", 0.5, "RSI bearish zone → mild LONG"))
+            votes.append(("rsi", 0.5, "RSI weak zone → mild LONG"))
         elif rsi > 55:
-            votes.append(("rsi", -0.5, "RSI bullish zone → mild SHORT"))
+            votes.append(("rsi", 0.5, "RSI strength zone → mild LONG (momentum)"))
         else:
             votes.append(("rsi", 0, "RSI neutral"))
 
@@ -108,14 +112,17 @@ class TechnicalModel(BaseModel):
         bb_lower = row.get("bb_lower", 0)
         bb_mid   = row.get("bb_mid", close)
 
+        # FIX Bug 4: Price above BB mid is BULLISH (above average), not SHORT.
+        # In an uptrend, price spends most time above mid-BB, so the previous
+        # code permanently voted SHORT, reinforcing the SHORT bias.
         if close <= bb_lower:
             votes.append(("bb", 1.5, "Price at BB lower → LONG"))
         elif close >= bb_upper:
             votes.append(("bb", -1.5, "Price at BB upper → SHORT"))
         elif close < bb_mid:
-            votes.append(("bb", 0.3, "Price below BB mid → mild LONG"))
+            votes.append(("bb", -0.3, "Price below BB mid → mild SHORT"))
         else:
-            votes.append(("bb", -0.3, "Price above BB mid → mild SHORT"))
+            votes.append(("bb", 0.3, "Price above BB mid → mild LONG"))
 
         # ── 5. Stochastic ───────────────────────────────────────────────────
         stoch_k = row.get("stoch_k", 50)

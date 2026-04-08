@@ -53,11 +53,14 @@ class HybridModel(BaseModel):
 
     TECHNICAL_WEIGHT     = 0.35
     ML_WEIGHT            = 0.65
-    AGREEMENT_BONUS      = 0.06
-    PROB_EMA_ALPHA       = 0.50
-    SPLIT_MIN_CONFIDENCE = 0.52
-    CONF_SCALE_LOW       = 0.40
-    CONF_SCALE_HIGH      = 0.92
+    # AGREEMENT_BONUS removed — it inflated noise signals above threshold.
+    # AGREE is now a gate (require_agree in TRENDING) not a confidence booster.
+    PROB_EMA_ALPHA       = 0.30   # lighter smoothing — less lag, faster reversal response
+    SPLIT_MIN_CONFIDENCE = 0.45   # lowered: output range is now 0.33-0.77 (unscaled)
+    # Confidence scaling removed. The model's raw probability IS the confidence.
+    # Artificial scaling [0.33→0.75] to [0.40→0.92] made random signals appear tradeable.
+    # Raw prob of 0.50 (barely above chance) now correctly shows as 0.50, not 0.76.
+    CONF_FLOOR = 0.33   # 3-class random baseline — output below this = no signal
 
     def __init__(self, symbol: str = "BTCUSDT"):
         self.symbol    = symbol
@@ -102,6 +105,19 @@ class HybridModel(BaseModel):
         )
 
     def _smooth_and_emit(self, raw: PredictionResult) -> PredictionResult:
+        """
+        Light EMA smoothing to reduce tick-noise, then honest confidence output.
+
+        Key changes from previous version:
+        - NO artificial confidence scaling. A 0.50 raw confidence is reported as 0.50.
+          The old [0.33→0.75]→[0.40→0.92] mapping made random noise look like
+          high-confidence signals. Every trade was 0.76-0.92 yet 0/10 profited.
+        - NO AGREE bonus. Agreement gates trades (require_agree) but doesn't
+          inflate confidence. A correct AGREE signal at 0.65 is worth more
+          than an inflated AGREE signal at 0.71 with no actual edge improvement.
+        - SPLIT requires higher raw confidence (0.60 vs 0.52) to proceed.
+        - Lighter EMA alpha (0.30 vs 0.50) reduces lag in fast-reversing markets.
+        """
         alpha = self.PROB_EMA_ALPHA
         s     = self._state
 
@@ -117,47 +133,36 @@ class HybridModel(BaseModel):
         smooth   = {Signal.LONG: s.ema_long, Signal.SHORT: s.ema_short, Signal.HOLD: ema_hold}
 
         signal    = max(smooth, key=smooth.get)
-        raw_conf  = smooth[signal]
-        agreement = raw.reasoning
+        confidence = smooth[signal]
+        agreement  = raw.reasoning
 
-        # Scale confidence from model's natural range → tradeable range
-        scaled = self._scale_confidence(raw_conf)
+        # SPLIT gate: if models disagree and confidence is below floor, treat as HOLD
+        if agreement == "SPLIT" and signal != Signal.HOLD:
+            if confidence < self.SPLIT_MIN_CONFIDENCE:
+                signal     = Signal.HOLD
+                confidence = confidence * 0.7
 
-        # Agreement adjustments
-        if agreement == "AGREE":
-            scaled = min(self.CONF_SCALE_HIGH, scaled + self.AGREEMENT_BONUS)
-        elif agreement == "SPLIT" and signal != Signal.HOLD:
-            if scaled < self.SPLIT_MIN_CONFIDENCE:
-                signal = Signal.HOLD
-                scaled = scaled * 0.7
+        # Sanity: confidence must exceed random baseline to be meaningful
+        if confidence <= self.CONF_FLOOR and signal != Signal.HOLD:
+            signal     = Signal.HOLD
+            confidence = confidence
 
         logger.info(
             f"[HYBRID] {self.symbol} {signal.value} | "
-            f"conf={scaled:.0%} (raw={raw_conf:.0%}) | {agreement} | "
+            f"conf={confidence:.2%} | {agreement} | "
             f"ema_L={s.ema_long:.2%} ema_S={s.ema_short:.2%}"
         )
 
         return PredictionResult(
-            signal=signal, confidence=scaled,
+            signal=signal, confidence=confidence,
             long_probability=s.ema_long, short_probability=s.ema_short,
             source="hybrid",
             reasoning=(
                 f"[HYBRID {agreement}] "
                 f"ema_long={s.ema_long:.2%} ema_short={s.ema_short:.2%} "
-                f"raw={raw_conf:.2%}"
+                f"raw_conf={smooth[signal]:.2%}"
             ),
         )
-
-    def _scale_confidence(self, raw: float) -> float:
-        """
-        Map raw model confidence [0.33, 0.75] → [CONF_SCALE_LOW, CONF_SCALE_HIGH].
-        0.33 = random (3-class noise floor), 0.75 = strong signal.
-        This ensures model outputs land in the tradeable 50–75% zone.
-        """
-        input_low, input_high = 0.33, 0.75
-        clamped    = max(input_low, min(input_high, raw))
-        normalized = (clamped - input_low) / (input_high - input_low)
-        return float(self.CONF_SCALE_LOW + normalized * (self.CONF_SCALE_HIGH - self.CONF_SCALE_LOW))
 
     def train_ml(self, df: pd.DataFrame, **kwargs):
         return self.ml.train(df, **kwargs)

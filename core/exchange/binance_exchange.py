@@ -40,6 +40,11 @@ class BinanceExchange(BaseExchange):
                     "defaultType": "future",
                     "fetchCurrencies": False,
                     "adjustForTimeDifference": True,
+                    # recvWindow: how long Binance accepts the request after its timestamp.
+                    # Default is 5000ms (5s). Windows machines commonly run 1-3s ahead
+                    # of server time, causing error -1021. 10000ms absorbs up to 10s skew.
+                    # Binance allows max 60000ms but 10000ms is safe and sufficient.
+                    "recvWindow": 10000,
                 },
                 "enableRateLimit": True,
             }
@@ -53,6 +58,17 @@ class BinanceExchange(BaseExchange):
                 self._exchange.urls["api"]["fapiPrivate"]   = f"{b}/fapi/v1"
                 self._exchange.urls["api"]["fapiPrivateV2"] = f"{b}/fapi/v2"
                 self._exchange.urls["api"]["fapiData"]      = f"{b}/futures/data"
+
+            # Sync ccxt's internal clock with Binance server time.
+            # Without this, ccxt uses the local system clock for request timestamps.
+            # load_time_difference() measures the offset once and applies it to all
+            # subsequent API calls — this is the primary fix for -1021 errors.
+            try:
+                await self._exchange.load_time_difference()
+                logger.info(f"[TIME] Clock synced with Binance server "
+                            f"(offset={self._exchange.options.get('timeDifference', 0)}ms)")
+            except Exception as te:
+                logger.warning(f"[TIME] Clock sync failed ({te}) — using recvWindow=10000ms fallback")
 
             await self._exchange.fetch_balance({"type": "future"})
             mode = "TESTNET" if self.credentials.testnet else "LIVE"
