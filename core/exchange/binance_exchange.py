@@ -82,6 +82,21 @@ class BinanceExchange(BaseExchange):
             logger.error(f"[FAIL] Connection error: {e}")
             return False
 
+    async def resync_clock(self) -> int:
+        """
+        Re-measure the local-vs-server clock offset and update ccxt's internal
+        timeDifference. Call periodically (e.g. every 30 minutes) to prevent
+        -1021 'Timestamp ahead of server' errors on long-running sessions.
+
+        Returns the new offset in milliseconds (negative = local clock is behind).
+        """
+        if self._exchange is None:
+            return 0
+        await self._exchange.load_time_difference()
+        offset = int(self._exchange.options.get('timeDifference', 0))
+        logger.info(f"[TIME] Clock re-synced with Binance server (offset={offset}ms)")
+        return offset
+
     async def get_balance(self) -> AccountBalance:
         try:
             balance = await self._exchange.fetch_balance({"type": "future"})

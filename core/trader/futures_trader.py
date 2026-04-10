@@ -110,7 +110,12 @@ class FuturesTrader:
     ADX_MIN        = 16.0   # minimum ADX for any trade — below = directionless
     # Minimum recent directional momentum: price must have moved at least this
     # fraction of ATR in the signal direction over the last 3 bars.
-    MIN_MOMENTUM_RATIO = 0.25  # close[-1] vs close[-4] must be >= 0.25 × ATR
+    MIN_MOMENTUM_RATIO = 0.15  # close[-1] vs close[-4] must be >= 0.15 × ATR
+    # Lowered from 0.25 — post-crash consolidation markets have 3-bar moves
+    # of only 30-60% of ATR, blocking all signal evaluation at 0.25.
+    # 0.15 still filters genuinely dead/news-halted markets while allowing
+    # signals in moderate-momentum conditions. The 68% confidence threshold
+    # remains the primary filter — this gate is only for extreme inactivity.
 
     # ── Profitability gate (Flaw 6) ───────────────────────────────────────
     # Minimum gross P&L headroom as a multiple of the roundtrip fee.
@@ -539,6 +544,20 @@ class FuturesTrader:
         self._cycles += 1
         logger.info(f"Cycle #{self._cycles} — {self.symbol}")
 
+        # ── Periodic clock resync (prevents -1021 after long runs) ───────
+        # load_time_difference() runs once at connect but Windows clocks drift.
+        # After ~60 minutes the stored offset becomes stale and -1021 errors
+        # reappear. Resyncing every 30 minutes keeps the offset fresh for the
+        # entire trading session without adding meaningful latency (one HTTP call).
+        try:
+            if not hasattr(self, '_last_time_sync'):
+                self._last_time_sync = 0.0
+            if time.monotonic() - self._last_time_sync > 1800:   # every 30 minutes
+                await self.exchange.resync_clock()
+                self._last_time_sync = time.monotonic()
+        except Exception as _te:
+            logger.warning(f"[TIME] Periodic resync failed (non-fatal): {_te}")
+
         try:
             # ── Market data ───────────────────────────────────────────────
             candles = await self.exchange.get_ohlcv(self.symbol, self.TIMEFRAME, limit=200)
@@ -710,7 +729,24 @@ class FuturesTrader:
 
             if prediction.signal == Signal.HOLD:
                 logger.info(f"[HOLD] {self.symbol}")
+                # Report HOLD to signals table so the AI Suggest panel on the
+                # dashboard always has current model state to display, even when
+                # the bot is correctly abstaining from trading.
                 if self._reporter:
+                    try:
+                        await self._reporter.report_signal(
+                            symbol          = self.symbol,
+                            signal          = "hold",
+                            confidence      = prediction.confidence,
+                            signal_type     = self._last_signal_type,
+                            regime          = self._last_regime,
+                            adx             = regime_params.adx if hasattr(regime_params, "adx") else None,
+                            atr_ratio       = atr_ratio,
+                            action_taken    = "hold",
+                            price_at_signal = current_price,
+                        )
+                    except Exception:
+                        pass   # non-critical — never block the trading loop
                     self._reporter.queue_log(
                         "info",
                         f"🔍 {self.symbol} — Analysed market. No clear trade opportunity right now "
