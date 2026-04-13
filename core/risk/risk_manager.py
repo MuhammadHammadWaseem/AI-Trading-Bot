@@ -239,33 +239,62 @@ class RiskManager:
             return self._reject(symbol, side, entry_price, "Calculated quantity is 0")
 
         # ── Minimum notional enforcement (Binance USDM requires >= $100) ─────
-        # After floor-rounding, the actual notional (qty × price) can drop below
-        # the exchange minimum even when position_usdt is above it.
-        # e.g. BTC @ $68k: position_usdt=$124 → qty_raw=0.00181 → floored=0.001
-        #      actual_notional = 0.001 × $68k = $68 → exchange rejects with -4164
-        # Fix: bump qty up to the next step if notional is below the minimum.
-        # Only proceed if the bump is ≤ 2× the intended position (avoid silent risk creep).
+        # The exchange rejects orders with notional < $100, regardless of position size.
+        # At small account balances (e.g. $100), the risk-based quantity is tiny
+        # (e.g. $3.65 notional for BNB) but the minimum viable trade is $100 notional.
+        # The solution: always bump to minimum notional, then verify the ACTUAL RISK
+        # (qty × SL_distance in price terms) stays within safe bounds.
+        # The $100 notional is not $100 of risk — at 10x leverage with ATR-based SL,
+        # the real dollar risk is typically 0.1–0.5% of account even at minimum notional.
+        was_bumped           = False   # set True if qty bumped to meet notional minimum
         MIN_BINANCE_NOTIONAL = 100.0
+        # Per-symbol quantity step sizes on Binance USDM futures
+        _SYMBOL_STEPS = {
+            "BTCUSDT": 0.001, "ETHUSDT": 0.001, "BNBUSDT": 0.001,
+            "SOLUSDT": 0.1,   "XRPUSDT": 1.0,   "ADAUSDT": 1.0,
+            "DOGEUSDT": 1.0,  "AVAXUSDT": 0.1,  "LINKUSDT": 0.01,
+            "DOTUSDT": 0.1,   "LTCUSDT": 0.001, "TRXUSDT": 1.0,
+        }
+        step = _SYMBOL_STEPS.get(symbol, 0.001)
+
         actual_notional = quantity * entry_price
+        was_bumped = False
         if actual_notional < MIN_BINANCE_NOTIONAL:
-            # Step size is 3 decimal places for most symbols
-            step = 10 ** -3
+            # Compute minimum qty that satisfies the notional floor
             min_qty = math.ceil(MIN_BINANCE_NOTIONAL / entry_price / step) * step
-            min_qty = round(min_qty, 3)
-            bumped_notional = min_qty * entry_price
-            oversize_ratio  = bumped_notional / position_usdt if position_usdt > 0 else 999
-            if oversize_ratio > 2.0:
+            min_qty = round(min_qty, max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0)
+
+            # Now verify the REAL RISK: how much USD do we lose if SL is hit?
+            # Use ATR-based SL distance if available, otherwise 2% of price as proxy.
+            if atr and atr > 0:
+                sl_m_used = sl_atr_mult or self.SL_ATR_MULT
+                sl_distance_price = atr * sl_m_used
+            else:
+                sl_distance_price = entry_price * 0.02   # 2% fallback
+
+            actual_risk_usdt = min_qty * sl_distance_price
+            MAX_RISK_ABS_PCT  = 5.0   # never risk more than 5% of balance on one trade
+            max_allowed_risk  = balance.available_balance * (MAX_RISK_ABS_PCT / 100)
+
+            if actual_risk_usdt > max_allowed_risk:
                 return self._reject(
                     symbol, side, entry_price,
-                    f"Notional too small: ${actual_notional:.2f} < ${MIN_BINANCE_NOTIONAL:.0f} minimum. "
-                    f"Bumping to min would require ${bumped_notional:.2f} ({oversize_ratio:.1f}× intended). "
-                    f"Increase balance or risk% to trade this symbol."
+                    f"Min notional trade risk too high: SL would risk "
+                    f"${actual_risk_usdt:.2f} ({actual_risk_usdt/balance.available_balance*100:.1f}% "
+                    f"of ${balance.available_balance:.0f} balance) which exceeds "
+                    f"{MAX_RISK_ABS_PCT}% safety limit. "
+                    f"Add more funds or reduce leverage to trade this symbol safely."
                 )
-            logger.info(
-                f"[MIN_NOTIONAL] {symbol} — qty bumped {quantity:.3f} → {min_qty:.3f} "
-                f"(notional: ${actual_notional:.2f} → ${bumped_notional:.2f}) to meet $100 minimum"
+
+            bumped_notional = min_qty * entry_price
+            logger.warning(
+                f"[MIN_NOTIONAL] {symbol} — qty bumped {quantity} → {min_qty} "
+                f"(notional ${actual_notional:.2f} → ${bumped_notional:.2f}) | "
+                f"actual SL risk: ${actual_risk_usdt:.2f} "
+                f"({actual_risk_usdt/balance.available_balance*100:.2f}% of balance)"
             )
-            quantity = min_qty
+            quantity  = min_qty
+            was_bumped = True
 
         # ── ATR-based TP/SL ───────────────────────────────────────────────
         sl_m = sl_atr_mult or self.SL_ATR_MULT
@@ -301,10 +330,11 @@ class RiskManager:
                                 f"TP direction wrong: SHORT TP={take_profit} >= entry={entry_price}")
 
         # ── Guard 2: Minimum SL distance (prevents noise-level stops) ────
-        # SL must be at least 0.10% of entry price away from entry.
-        # A tighter SL will be hit by normal bid/ask spread or slippage.
-        MIN_SL_PCT = 0.10  # 0.10% minimum
-        sl_dist    = abs(entry_price - stop_loss)
+        # SL must be at least 0.05% of entry price away from entry.
+        # Tighter = higher chance of immediate noise stop-out.
+        # 0.05% (5 basis points) is the minimum viable SL for crypto futures.
+        MIN_SL_PCT  = 0.05  # 0.05% minimum (was 0.10% — relaxed for ATR-based SL)
+        sl_dist     = abs(entry_price - stop_loss)
         min_sl_dist = entry_price * (MIN_SL_PCT / 100)
         if sl_dist < min_sl_dist:
             return self._reject(symbol, side, entry_price,
@@ -322,8 +352,12 @@ class RiskManager:
                                 f"R:R too low: tp_dist={tp_dist:.4f} / sl_dist={sl_dist:.4f} "
                                 f"= {actual_rr:.3f} < {MIN_RR}. Trade would be structurally unprofitable.")
 
+        # Log clearly whether this was a bumped (min-notional) or normal trade
+        notional_note = f" [bumped to min notional]" if was_bumped else ""
+        actual_notional_final = quantity * entry_price
         logger.info(
             f"Trade: {symbol} {side.value.upper()} | qty={quantity} | lev={lev}x | "
+            f"notional=${actual_notional_final:.2f}{notional_note} | "
             f"TP={take_profit} SL={stop_loss} | R:R={actual_rr:.2f} | risk={risk_amount:.2f} USDT"
         )
 

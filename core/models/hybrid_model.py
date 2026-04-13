@@ -55,8 +55,8 @@ class HybridModel(BaseModel):
     ML_WEIGHT            = 0.65
     # AGREEMENT_BONUS removed — it inflated noise signals above threshold.
     # AGREE is now a gate (require_agree in TRENDING) not a confidence booster.
-    PROB_EMA_ALPHA       = 0.30   # lighter smoothing — less lag, faster reversal response
-    SPLIT_MIN_CONFIDENCE = 0.45   # lowered: output range is now 0.33-0.77 (unscaled)
+    PROB_EMA_ALPHA       = 0.70   # high alpha: new signal dominates, prevents EMA convergence to HOLD
+    SPLIT_MIN_CONFIDENCE = 0.40   # further lowered to match retrained model output range (0.37-0.65)
     # Confidence scaling removed. The model's raw probability IS the confidence.
     # Artificial scaling [0.33→0.75] to [0.40→0.92] made random signals appear tradeable.
     # Raw prob of 0.50 (barely above chance) now correctly shows as 0.50, not 0.76.
@@ -126,8 +126,18 @@ class HybridModel(BaseModel):
             s.ema_short = raw.short_probability
             s.initialized = True
         else:
-            s.ema_long  = alpha * raw.long_probability  + (1 - alpha) * s.ema_long
-            s.ema_short = alpha * raw.short_probability + (1 - alpha) * s.ema_short
+            # Only update EMA when the raw model has directional conviction.
+            # If the raw signal is HOLD (long_prob ≈ short_prob ≈ hold_prob),
+            # skip the update. This prevents the EMA from converging to
+            # ema_L ≈ ema_S ≈ 0.37 after many HOLD cycles, which permanently
+            # locks the model in HOLD regardless of future signals.
+            raw_hold_prob = max(0.0, 1.0 - raw.long_probability - raw.short_probability)
+            raw_is_directional = (raw.signal != Signal.HOLD and
+                                  max(raw.long_probability, raw.short_probability) > raw_hold_prob)
+            if raw_is_directional:
+                s.ema_long  = alpha * raw.long_probability  + (1 - alpha) * s.ema_long
+                s.ema_short = alpha * raw.short_probability + (1 - alpha) * s.ema_short
+            # If raw HOLD: keep existing EMA — let directional memory persist
 
         ema_hold = max(0.0, 1.0 - s.ema_long - s.ema_short)
         smooth   = {Signal.LONG: s.ema_long, Signal.SHORT: s.ema_short, Signal.HOLD: ema_hold}
