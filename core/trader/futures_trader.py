@@ -88,7 +88,10 @@ _STOCH_OVERSOLD         = 30
 _STOCH_OVERBOUGHT       = 70
 _ATR_RATIO_MAX_RANGE    = 1.10   # above this → possible breakout, skip range
 _RANGE_SL_ATR_MULT      = 1.5
-_RANGE_TP_ATR_MULT      = 2.5
+_RANGE_TP_ATR_MULT      = 3.5    # was 2.5 → 4.0 → 3.5 (optimal)
+# At 3.5×ATR: SOL net R:R=1.62 (BE=38%), BNB net R:R=1.24 (BE=45%)
+# 4.0x overshoots the actual Bollinger Band width → TP rarely hit
+# 3.5x targets just past BB_mid, reachable in a genuine range reversal
 _MIN_QUALITY            = 0.55
 
 
@@ -342,7 +345,8 @@ class FuturesTrader:
     MAX_CLOSE_RETRIES  = 3
     CLOSE_RETRY_DELAY  = 1.0   # seconds between retries
     SETTLE_DELAY       = 1.5   # seconds to wait after SL/TP/exit trigger
-    TAKER_FEE_RATE     = 0.0005  # 0.05% per side (Binance USDM standard taker fee)
+    TAKER_FEE_RATE     = 0.0004  # 0.04% per side (Binance USDM futures taker fee)
+    # Standard Binance USDM futures taker: 0.04%. Was 0.0005 which overstated fees.
                                   # Update to 0.0002 if you have BNB fee discount or VIP tier
                                # before attempting close, to let the exchange
                                # settle its own fill.
@@ -1004,7 +1008,14 @@ class FuturesTrader:
                             * self.TAKER_FEE_RATE
                             * 2
                         )
-                        if expected_gross < roundtrip_fee * self.MIN_FEE_MULTIPLE:
+                        net_tp_range = expected_gross - roundtrip_fee
+                        net_sl_range = sl_dist_approx * range_trade_params.quantity + roundtrip_fee
+                        net_rr_range = net_tp_range / net_sl_range if net_sl_range > 0 else 0
+                        if net_tp_range <= 0 or net_rr_range < 1.2:
+                            logger.info(
+                                f"[RANGE SKIP:PAYOFF] {self.symbol} — "
+                                f"net_RR={net_rr_range:.2f} < 1.2 after fees"
+                            )
                             return
 
                     logger.info(
@@ -1262,18 +1273,25 @@ class FuturesTrader:
                 sl_dist_approx   = abs(trade_params.entry_price - trade_params.stop_loss)
                 expected_gross   = sl_dist_approx * trade_params.quantity * regime_params.tp_mult / regime_params.sl_mult
                 roundtrip_fee    = trade_params.entry_price * trade_params.quantity * self.TAKER_FEE_RATE * 2
-                if expected_gross < roundtrip_fee * self.MIN_FEE_MULTIPLE:
+                # Fee-aware profitability gate:
+                # After fees, the net R:R must exceed 1.2 (trade needs meaningful edge)
+                net_tp = expected_gross - roundtrip_fee
+                net_sl = sl_dist_approx * trade_params.quantity + roundtrip_fee
+                net_rr = net_tp / net_sl if net_sl > 0 else 0
+                min_net_rr = 1.2  # minimum net R:R after fees
+
+                if net_tp <= 0 or net_rr < min_net_rr:
                     logger.info(
-                        f"[SKIP:PAYOFF] {self.symbol} — expected_gross=${expected_gross:.4f} < "
-                        f"{self.MIN_FEE_MULTIPLE}×fee=${roundtrip_fee*self.MIN_FEE_MULTIPLE:.4f}. "
-                        f"Trade cannot net profit at this position size."
+                        f"[SKIP:PAYOFF] {self.symbol} — "
+                        f"net_TP=${net_tp:.4f} net_RR={net_rr:.2f} < min {min_net_rr}. "
+                        f"Fee=${roundtrip_fee:.4f} eats too much of the edge."
                     )
                     if self._reporter:
                         self._reporter.queue_log(
                             "info",
-                            f"📊 {self.symbol} — Trade skipped: expected payoff (${expected_gross:.2f}) "
-                            f"is too small relative to fees (${roundtrip_fee:.2f} roundtrip). "
-                            f"Increase position size or wait for higher-ATR conditions.",
+                            f"📊 {self.symbol} — Trade skipped: net R:R after fees "
+                            f"({net_rr:.2f}) below minimum ({min_net_rr}). "
+                            f"Fee=${roundtrip_fee:.3f} vs gross TP=${expected_gross:.3f}.",
                             channel="signal"
                         )
                     return
