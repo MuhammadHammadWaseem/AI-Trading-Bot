@@ -295,7 +295,10 @@ class FuturesTrader:
     ADX_MIN        = 16.0   # minimum ADX for any trade — below = directionless
     # Minimum recent directional momentum: price must have moved at least this
     # fraction of ATR in the signal direction over the last 3 bars.
-    MIN_MOMENTUM_RATIO = 0.15  # close[-1] vs close[-4] must be >= 0.15 × ATR
+    MIN_MOMENTUM_RATIO = 0.10  # close[-1] vs close[-4] must be >= 0.10 × ATR
+    # Lowered from 0.15 — in RANGE/LOW_VOL regimes with small ATR (0.15-0.17),
+    # 0.15×ATR = 0.023 on SOL, blocking even valid setups with a tiny 3-bar move.
+    # 0.10 still filters genuinely dead/news-halted markets (0 move is < 0.10×ATR)
     # Lowered from 0.25 — post-crash consolidation markets have 3-bar moves
     # of only 30-60% of ATR, blocking all signal evaluation at 0.25.
     # 0.15 still filters genuinely dead/news-halted markets while allowing
@@ -309,15 +312,22 @@ class FuturesTrader:
     MIN_FEE_MULTIPLE   = 2.5   # expected_gross must be >= 2.5 × roundtrip_fee
 
     # ── Confidence ────────────────────────────────────────────────────────
-    BASE_THRESHOLD = 0.55
+    BASE_THRESHOLD = 0.50  # Class-level fallback — real value comes from dashboard config.
+    # was 0.55; lowered to give more room for regime-specific adjustments.
+    # Per-symbol dashboard settings override this (BNB=55%, SOL=62%, etc.)
     SPLIT_MIN_CONF = 0.40   # aligned with hybrid_model.py SPLIT_MIN_CONFIDENCE
-    RECALIB_CAP    = 0.08
+    RECALIB_CAP    = 0.06  # was 0.08: +8pp cap could raise threshold so high
+    # that no signals pass (model rarely exceeds 65%). +6pp is the safe max.
+    # Still protects capital during losing streaks without freezing the bot.
 
     # ── Directional loss streak suppression (Flaw 7) ─────────────────────
     # After this many consecutive losses in the same direction, block that
     # direction for STREAK_COOLDOWN_BARS before allowing re-entry.
-    MAX_DIRECTION_LOSSES = 3
-    STREAK_COOLDOWN_BARS = 8   # ~40 min at 5m bars
+    MAX_DIRECTION_LOSSES = 4  # was 3: 3-loss block was too aggressive in range markets
+    # where model direction can be wrong 3× in a row just from oscillation.
+    # 4 consecutive same-direction losses before suppression.
+    STREAK_COOLDOWN_BARS = 5   # ~25 min at 5m bars
+    # was 8 (40min) — 40 min suppression too long in active ranging markets
 
     # ── Variable cooldown by exit reason (Flaw 5) ─────────────────────────
     COOLDOWN_BY_REASON: dict = {
@@ -833,7 +843,8 @@ class FuturesTrader:
             # ── Signal timing gate ────────────────────────────────────────
             first_cycle = (self._last_eval_time == 0.0)
             if not self._should_evaluate_signal(df_1m, force=first_cycle):
-                logger.info(f"[GATE] {self.symbol} — waiting for next eval window")
+                logger.info(f"[GATE] {self.symbol} — waiting for next eval window "
+                    f"| {self._bars_since_eval if hasattr(self, '_bars_since_eval') else '?'}/{self.EVAL_WINDOW_BARS if hasattr(self, 'EVAL_WINDOW_BARS') else '?'} bars")
                 if self._reporter and self._cycles % 3 == 0:  # log every ~15s not every 5s
                     price_str = ""
                     try:
@@ -882,7 +893,10 @@ class FuturesTrader:
                                    f"{self.MIN_MOMENTUM_RATIO}×ATR={self.MIN_MOMENTUM_RATIO*atr_cur:.4f})")
 
             if skip_reason:
-                logger.info(f"[SKIP:MARKET] {self.symbol} — {skip_reason}")
+                logger.info(
+                    f"[SKIP:MARKET] {self.symbol} — {skip_reason} "
+                    f"| regime={regime_params.regime.value} ATR={atr_cur:.4f}"
+                )
                 if self._reporter:
                     self._reporter.queue_log(
                         "info",
@@ -916,7 +930,11 @@ class FuturesTrader:
             )
 
             if prediction.signal == Signal.HOLD:
-                logger.info(f"[HOLD] {self.symbol}")
+                logger.info(
+                    f"[HOLD] {self.symbol} — conf={prediction.confidence:.0%} "
+                    f"| regime={regime_params.regime.value} "
+                    f"| L={prediction.long_probability:.0%} S={prediction.short_probability:.0%}"
+                )
                 # Report HOLD to signals table for dashboard
                 if self._reporter:
                     try:
@@ -1041,9 +1059,14 @@ class FuturesTrader:
             eff_threshold = self._effective_threshold(regime_params, side)
 
             if prediction.confidence < eff_threshold:
+                recalib_adj_pct = self.recalibrator.get_threshold_adjustment(
+                    self.symbol, side.value)
+                regime_adj_pct  = regime_params.conf_thr_delta * 100
                 logger.info(
-                    f"[SKIP:CONF] {self.symbol} — "
-                    f"conf={prediction.confidence:.2%} < threshold={eff_threshold:.2%}"
+                    f"[SKIP:CONF] {self.symbol} {side.value.upper()} — "
+                    f"conf={prediction.confidence:.2%} < thr={eff_threshold:.2%} "
+                    f"(base={self.BASE_THRESHOLD:.0%} recalib={recalib_adj_pct:+.1f}pp "
+                    f"regime={regime_adj_pct:+.1f}pp)"
                 )
                 if self._reporter:
                     direction = "LONG 📈" if side == OrderSide.LONG else "SHORT 📉"

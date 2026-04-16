@@ -72,10 +72,10 @@ class SignalRecalibrator:
     WINDOW_SIZE      = 20    # rolling window of recent trades per direction
     PAUSE_THRESHOLD  = 0.35  # if win rate drops below 35%, add penalty
     BOOST_THRESHOLD  = 0.60  # if win rate above 60%, reduce threshold slightly
-    PENALTY_PP       = 5.0   # pp added to threshold when win rate is poor
+    PENALTY_PP       = 4.0   # was 5.0 — gentler penalty: 4pp instead of 5pp per poor-WR period
     BOOST_PP         = 2.0   # pp removed from threshold when win rate is good
-    ADJUSTMENT_CAP   = 8.0   # maximum total adjustment in either direction
-    MIN_TRADES       = 5     # minimum trades before adjustments activate
+    ADJUSTMENT_CAP   = 6.0   # was 8.0 — max 6pp matches futures_trader RECALIB_CAP
+    MIN_TRADES       = 6     # was 5 — require at least 6 trades before applying penalties
 
     def __init__(self, log_dir: Optional[Path] = None):
         # Rolling windows: {symbol: {direction: deque[TradeRecord]}}
