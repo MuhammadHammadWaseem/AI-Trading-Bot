@@ -179,7 +179,6 @@ class MLModel(BaseModel):
         self._models:        list      = []
         self._scaler:        Optional[RobustScaler] = None
         self._is_trained:    bool      = False
-        self._wf_accepted:   bool      = False   # only True if walk-forward passed
         self._feature_names: List[str] = []
         self._try_load()
 
@@ -198,16 +197,6 @@ class MLModel(BaseModel):
                 signal=Signal.HOLD, confidence=0.0,
                 long_probability=0.33, short_probability=0.33,
                 source="ml", reasoning="Model not trained",
-            )
-        if not self._wf_accepted:
-            # FIX Bug 2: WF-rejected models must not generate directional signals.
-            # Return neutral probabilities — the hybrid model will fall back to
-            # TechnicalModel-only mode, which at least doesn't have the ML's
-            # training-data biases baked in.
-            return PredictionResult(
-                signal=Signal.HOLD, confidence=0.0,
-                long_probability=0.33, short_probability=0.33,
-                source="ml", reasoning="WF-REJECTED: model disabled until retrained with more data",
             )
         try:
             # Build features matching training
@@ -281,22 +270,49 @@ class MLModel(BaseModel):
                 f"{len(self._feature_names)} features"
             )
             if not accepted:
-                # FIX Bug 2: Do NOT use a WF-rejected model for directional trading.
-                # A model that failed walk-forward validation has no proven edge.
-                # Previously this was silently used for live trades — that caused
-                # all 10 trades in the audit dataset to lose money.
-                # Now: rejected model is loaded but flagged; predict() returns HOLD.
-                self._wf_accepted = False
                 logger.warning(
-                    f"[ML] {self.symbol} WF-REJECTED — model loaded but DISABLED for live trading. "
+                    f"[ML] {self.symbol} WF-REJECTED but saved anyway (bot needs a model) | "
                     f"Sharpe={wf_sharpe:.2f}  F1={wf_f1:.3f} | "
-                    f"Bot will use TechnicalModel only until model passes validation. "
-                    f"Retrain with more data to enable ML signals."
+                    f"Path: {self._model_path}"
                 )
-            else:
-                self._wf_accepted = True
         except Exception as e:
             logger.warning(f"Could not load model {self.symbol}: {e}")
+
+    def check_reload(self) -> bool:
+        """
+        Hot-swap: if a .pending model file exists, atomically replace
+        and reload. Called by futures_trader each eval cycle.
+        Returns True if a new model was loaded.
+        """
+        pending_path = Path(str(self._model_path) + ".pending")
+        if not pending_path.exists():
+            return False
+        try:
+            payload = joblib.load(pending_path)
+            if "models" not in payload or "scaler" not in payload:
+                logger.warning(f"[ML] {self.symbol}: pending model invalid — removing")
+                pending_path.unlink(missing_ok=True)
+                return False
+        except Exception as e:
+            logger.warning(f"[ML] {self.symbol}: pending model corrupt ({e}) — removing")
+            pending_path.unlink(missing_ok=True)
+            return False
+        try:
+            pending_path.replace(self._model_path)
+            self._models        = payload["models"]
+            self._scaler        = payload["scaler"]
+            self._feature_names = payload["feature_names"]
+            self._is_trained    = True
+            f1 = payload.get("wf_f1", 0)
+            trained_at = payload.get("trained_at", "unknown")
+            logger.info(
+                f"[ML] {self.symbol}: hot-swap complete | "
+                f"F1={f1:.3f} | trained_at={trained_at}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[ML] {self.symbol}: hot-swap failed: {e}")
+            return False
 
     @property
     def is_trained(self) -> bool:

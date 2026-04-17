@@ -913,6 +913,14 @@ class FuturesTrader:
                     if self._direction_suppressed_bars.get(d, 0) > 0:
                         self._direction_suppressed_bars[d] -= 1
 
+            # ── Hot-swap: pick up any newly retrained model ─────────────
+            # auto_retrain.py saves ml_SYMBOL.joblib.pending when a new
+            # model passes quality gates. check_reload() atomically swaps
+            # it in so the bot uses the new model from the next prediction.
+            if hasattr(self.model, "ml") and hasattr(self.model.ml, "check_reload"):
+                if self.model.ml.check_reload():
+                    logger.info(f"[HOT-SWAP] {self.symbol}: new model active")
+
             # ── Signal evaluation ─────────────────────────────────────────
             prediction = self.model.predict(df, df_1h=df_1h)
             self._last_eval_time = time.monotonic()
