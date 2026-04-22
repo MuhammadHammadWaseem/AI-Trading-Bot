@@ -233,8 +233,17 @@ class RiskManager:
         # ── Position sizing ───────────────────────────────────────────────
         risk_amount   = balance.available_balance * (r_pct / 100) * size_scale
         position_usdt = risk_amount * lev
-        quantity      = self._round_quantity(position_usdt / entry_price)
+        qty_raw       = position_usdt / entry_price
+        quantity      = self._round_quantity(qty_raw)
 
+        # If floor-rounding produces 0 (e.g. BTC at $83k with $85 position),
+        # try ceil before rejecting — the MIN_NOTIONAL bump below will handle
+        # the notional check. Only reject if even ceil gives 0 (impossible in practice).
+        if quantity <= 0:
+            import math as _math
+            precision = 3
+            factor    = 10 ** precision
+            quantity  = _math.ceil(qty_raw * factor) / factor
         if quantity <= 0:
             return self._reject(symbol, side, entry_price, "Calculated quantity is 0")
 

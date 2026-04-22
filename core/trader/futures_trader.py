@@ -61,6 +61,7 @@ from core.models.hybrid_model import HybridModel
 from core.models.base_model import Signal
 from core.models.signal_recalibrator import SignalRecalibrator
 from core.risk.risk_manager import RiskManager, TradeParameters
+from core.market.news_filter import NewsFilter, SentimentState
 from core.market.regime_detector import RegimeDetector, Regime, RegimeParams
 from core.strategy.recovery_strategy import RecoveryStrategy
 from data.indicators import ohlcv_to_dataframe, add_all_indicators
@@ -72,187 +73,6 @@ logger = get_logger(__name__)
 
 def _normalize_symbol(symbol: str) -> str:
     return symbol.replace("/", "").replace(":USDT", "").replace(":BTC", "").upper()
-
-
-# ── Range Strategy (inlined — no separate file required) ─────────────────────
-
-from dataclasses import dataclass as _dataclass, field as _field
-from datetime import datetime as _datetime, timezone as _timezone
-
-_MAX_RANGE_TRADES_DAY   = 4      # max range trades per symbol per UTC day
-_MIN_BARS_BETWEEN       = 6      # 30 min cooldown between range entries (6 × 5m)
-_BAND_TOUCH_BUFFER      = 0.003  # 0.3% tolerance for "at the band"
-_RSI_OVERSOLD           = 38
-_RSI_OVERBOUGHT         = 62
-_STOCH_OVERSOLD         = 30
-_STOCH_OVERBOUGHT       = 70
-_ATR_RATIO_MAX_RANGE    = 1.10   # above this → possible breakout, skip range
-_RANGE_SL_ATR_MULT      = 1.5
-_RANGE_TP_ATR_MULT      = 3.5    # was 2.5 → 4.0 → 3.5 (optimal)
-# At 3.5×ATR: SOL net R:R=1.62 (BE=38%), BNB net R:R=1.24 (BE=45%)
-# 4.0x overshoots the actual Bollinger Band width → TP rarely hit
-# 3.5x targets just past BB_mid, reachable in a genuine range reversal
-_MIN_QUALITY            = 0.55
-
-
-@_dataclass
-class RangeSignal:
-    has_signal:  bool
-    direction:   str    # "LONG" | "SHORT" | "NONE"
-    quality:     float  # 0–1
-    sl_atr_mult: float
-    tp_atr_mult: float
-    reason:      str
-    rsi:         float = 0.0
-    stoch_k:     float = 0.0
-    atr_ratio:   float = 0.0
-
-    @property
-    def is_long(self) -> bool:
-        return self.direction == "LONG"
-
-    @property
-    def is_short(self) -> bool:
-        return self.direction == "SHORT"
-
-
-class RangeStrategy:
-    """
-    Rule-based mean-reversion fallback for ranging / low-volatility markets.
-    Activates when the ML model has no edge (confidence below threshold).
-
-    Entry logic:
-      LONG:  price <= bb_lower (+buffer) AND rsi < 38 AND stoch_k < 30
-      SHORT: price >= bb_upper (-buffer) AND rsi > 62 AND stoch_k > 70
-    SL = 1.5×ATR outside the band. TP = 2.5×ATR toward opposite band.
-    """
-
-    def __init__(self, symbol: str):
-        self.symbol         = symbol
-        self._bar_counter   = 0
-        self._trades_today  = 0
-        self._last_bar      = -999
-        self._reset_date    = ""
-        self._consec_losses = 0
-        self._consec_wins   = 0
-
-    def evaluate(self, df, atr_ratio: float, regime: str) -> RangeSignal:
-        """Evaluate the current candle for a range trade setup."""
-        self._bar_counter += 1
-        self._reset_daily()
-
-        _no = RangeSignal(
-            has_signal=False, direction="NONE", quality=0.0,
-            sl_atr_mult=_RANGE_SL_ATR_MULT, tp_atr_mult=_RANGE_TP_ATR_MULT,
-            reason="no setup", atr_ratio=atr_ratio,
-        )
-
-        if len(df) < 20:
-            return _no
-
-        # Rate limiting
-        if self._trades_today >= _MAX_RANGE_TRADES_DAY:
-            return _no
-        if (self._bar_counter - self._last_bar) < _MIN_BARS_BETWEEN:
-            return _no
-
-        # Do not range-trade during breakouts
-        if atr_ratio > _ATR_RATIO_MAX_RANGE:
-            return _no
-
-        row   = df.iloc[-1]
-        prev  = df.iloc[-2]
-        close = float(row["close"])
-        prev_c = float(prev["close"])
-
-        bb_upper = float(row.get("bb_upper", 0) or 0)
-        bb_lower = float(row.get("bb_lower", 0) or 0)
-        bb_mid   = float(row.get("bb_mid", close) or close)
-        rsi      = float(row.get("rsi", 50) or 50)
-        stoch_k  = float(row.get("stoch_k", 50) or 50)
-        stoch_d  = float(row.get("stoch_d", 50) or 50)
-        atr_cur  = float(row.get("atr", 0) or 0)
-
-        if bb_upper <= 0 or bb_lower <= 0 or atr_cur <= 0:
-            return _no
-
-        bb_range = bb_upper - bb_lower
-        bb_pos   = (close - bb_lower) / bb_range if bb_range > 0 else 0.5
-
-        # ── LONG: price at lower band ─────────────────────────────────────────
-        if (close <= bb_lower * (1 + _BAND_TOUCH_BUFFER)
-                and rsi < _RSI_OVERSOLD
-                and stoch_k < _STOCH_OVERSOLD
-                and close <= prev_c + 0.5 * atr_cur):
-
-            quality = 0.50
-            if rsi < 25:        quality += 0.20
-            elif rsi < 30:      quality += 0.12
-            if stoch_k > stoch_d and stoch_k < 25: quality += 0.15
-            elif stoch_k < 20:  quality += 0.08
-            if close < bb_lower: quality += 0.15
-            if atr_ratio < 0.80: quality += 0.10
-            elif atr_ratio < 0.90: quality += 0.05
-            if self._consec_losses >= 2:
-                quality -= 0.15 * self._consec_losses
-            quality = max(0.0, min(1.0, quality))
-
-            if quality >= _MIN_QUALITY:
-                return RangeSignal(
-                    has_signal=True, direction="LONG", quality=quality,
-                    sl_atr_mult=_RANGE_SL_ATR_MULT, tp_atr_mult=_RANGE_TP_ATR_MULT,
-                    reason=f"BB_lower touch | RSI={rsi:.1f} Stoch={stoch_k:.1f}",
-                    rsi=rsi, stoch_k=stoch_k, atr_ratio=atr_ratio,
-                )
-
-        # ── SHORT: price at upper band ────────────────────────────────────────
-        if (close >= bb_upper * (1 - _BAND_TOUCH_BUFFER)
-                and rsi > _RSI_OVERBOUGHT
-                and stoch_k > _STOCH_OVERBOUGHT
-                and close >= prev_c - 0.5 * atr_cur):
-
-            quality = 0.50
-            if rsi > 75:        quality += 0.20
-            elif rsi > 70:      quality += 0.12
-            if stoch_k < stoch_d and stoch_k > 75: quality += 0.15
-            elif stoch_k > 80:  quality += 0.08
-            if close > bb_upper: quality += 0.15
-            if atr_ratio < 0.80: quality += 0.10
-            elif atr_ratio < 0.90: quality += 0.05
-            if self._consec_losses >= 2:
-                quality -= 0.15 * self._consec_losses
-            quality = max(0.0, min(1.0, quality))
-
-            if quality >= _MIN_QUALITY:
-                return RangeSignal(
-                    has_signal=True, direction="SHORT", quality=quality,
-                    sl_atr_mult=_RANGE_SL_ATR_MULT, tp_atr_mult=_RANGE_TP_ATR_MULT,
-                    reason=f"BB_upper touch | RSI={rsi:.1f} Stoch={stoch_k:.1f}",
-                    rsi=rsi, stoch_k=stoch_k, atr_ratio=atr_ratio,
-                )
-
-        return _no
-
-    def record_trade(self) -> None:
-        self._trades_today += 1
-        self._last_bar      = self._bar_counter
-
-    def record_outcome(self, won: bool) -> None:
-        if won:
-            self._consec_wins  += 1
-            self._consec_losses = 0
-        else:
-            self._consec_losses += 1
-            self._consec_wins    = 0
-
-    def _reset_daily(self) -> None:
-        today = _datetime.now(_timezone.utc).strftime("%Y-%m-%d")
-        if self._reset_date != today:
-            self._trades_today = 0
-            self._reset_date   = today
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class FuturesTrader:
@@ -286,24 +106,12 @@ class FuturesTrader:
     MIN_HOLD_BARS        = 3     # was 2 — need at least 3 bars before any exit logic
 
     # ── Volatility / market readiness gates ──────────────────────────────
-    ATR_RATIO_MIN  = 0.75   # current ATR must be >= 75% of rolling mean
-    # Lowered from 0.90 — post-crash markets have sustained lower ATR than the
-    # 20-bar mean. 0.90 blocked ALL signals when ATR_ratio=0.74-0.87. 0.75
-    # still filters genuine dead-market conditions (news halt, weekend) while
-    # allowing moderate-activity periods where the model can find edge.
+    ATR_RATIO_MIN  = 0.90   # current ATR must be >= 90% of rolling mean
     ATR_RATIO_MAX  = 2.50   # reject extreme spike volatility (news/liquidation)
-    ADX_MIN        = 16.0   # minimum ADX for any trade — below = directionless
+    ADX_MIN        = 14.0   # lowered 16→14: April 2026 low-vol market; BTC/ETH ADX 13-15
     # Minimum recent directional momentum: price must have moved at least this
     # fraction of ATR in the signal direction over the last 3 bars.
-    MIN_MOMENTUM_RATIO = 0.10  # close[-1] vs close[-4] must be >= 0.10 × ATR
-    # Lowered from 0.15 — in RANGE/LOW_VOL regimes with small ATR (0.15-0.17),
-    # 0.15×ATR = 0.023 on SOL, blocking even valid setups with a tiny 3-bar move.
-    # 0.10 still filters genuinely dead/news-halted markets (0 move is < 0.10×ATR)
-    # Lowered from 0.25 — post-crash consolidation markets have 3-bar moves
-    # of only 30-60% of ATR, blocking all signal evaluation at 0.25.
-    # 0.15 still filters genuinely dead/news-halted markets while allowing
-    # signals in moderate-momentum conditions. The 68% confidence threshold
-    # remains the primary filter — this gate is only for extreme inactivity.
+    MIN_MOMENTUM_RATIO = 0.25  # close[-1] vs close[-4] must be >= 0.25 × ATR
 
     # ── Profitability gate (Flaw 6) ───────────────────────────────────────
     # Minimum gross P&L headroom as a multiple of the roundtrip fee.
@@ -312,22 +120,15 @@ class FuturesTrader:
     MIN_FEE_MULTIPLE   = 2.5   # expected_gross must be >= 2.5 × roundtrip_fee
 
     # ── Confidence ────────────────────────────────────────────────────────
-    BASE_THRESHOLD = 0.50  # Class-level fallback — real value comes from dashboard config.
-    # was 0.55; lowered to give more room for regime-specific adjustments.
-    # Per-symbol dashboard settings override this (BNB=55%, SOL=62%, etc.)
-    SPLIT_MIN_CONF = 0.40   # aligned with hybrid_model.py SPLIT_MIN_CONFIDENCE
-    RECALIB_CAP    = 0.06  # was 0.08: +8pp cap could raise threshold so high
-    # that no signals pass (model rarely exceeds 65%). +6pp is the safe max.
-    # Still protects capital during losing streaks without freezing the bot.
+    BASE_THRESHOLD = 0.55
+    SPLIT_MIN_CONF = 0.52
+    RECALIB_CAP    = 0.08
 
     # ── Directional loss streak suppression (Flaw 7) ─────────────────────
     # After this many consecutive losses in the same direction, block that
     # direction for STREAK_COOLDOWN_BARS before allowing re-entry.
-    MAX_DIRECTION_LOSSES = 4  # was 3: 3-loss block was too aggressive in range markets
-    # where model direction can be wrong 3× in a row just from oscillation.
-    # 4 consecutive same-direction losses before suppression.
-    STREAK_COOLDOWN_BARS = 5   # ~25 min at 5m bars
-    # was 8 (40min) — 40 min suppression too long in active ranging markets
+    MAX_DIRECTION_LOSSES = 3
+    STREAK_COOLDOWN_BARS = 8   # ~40 min at 5m bars
 
     # ── Variable cooldown by exit reason (Flaw 5) ─────────────────────────
     COOLDOWN_BY_REASON: dict = {
@@ -355,8 +156,7 @@ class FuturesTrader:
     MAX_CLOSE_RETRIES  = 3
     CLOSE_RETRY_DELAY  = 1.0   # seconds between retries
     SETTLE_DELAY       = 1.5   # seconds to wait after SL/TP/exit trigger
-    TAKER_FEE_RATE     = 0.0004  # 0.04% per side (Binance USDM futures taker fee)
-    # Standard Binance USDM futures taker: 0.04%. Was 0.0005 which overstated fees.
+    TAKER_FEE_RATE     = 0.0005  # 0.05% per side (Binance USDM standard taker fee)
                                   # Update to 0.0002 if you have BNB fee discount or VIP tier
                                # before attempting close, to let the exchange
                                # settle its own fill.
@@ -380,14 +180,15 @@ class FuturesTrader:
         daily_profit_target:   float = None,
         base_threshold:        float = None,
         timeframe:             str   = None,
+        news_filter:           object = None,  # NewsFilter shared instance
         **kwargs,
     ):
         self.exchange     = exchange
         self.symbol       = symbol
         self.model        = HybridModel(symbol=symbol)
-        self.range_strat  = RangeStrategy(symbol=symbol)  # fallback for ranging/quiet markets
         self.regime       = RegimeDetector(symbol=symbol)
         self.recalibrator = recalibrator or SignalRecalibrator()
+        self._news        = news_filter  # optional shared NewsFilter (or None)
 
         # ── Auto-instantiate when not provided (managed mode) ─────────────
         self.recovery = recovery_strategy or RecoveryStrategy()
@@ -500,6 +301,17 @@ class FuturesTrader:
         # HARD FLOOR: never go below user's configured minimum, regardless of
         # regime or recalibration adjustments.
         eff = max(eff, self.BASE_THRESHOLD)
+
+        # News CAUTION: if sentiment is cautious, raise threshold by CAUTION_PENALTY
+        if self._news is not None:
+            try:
+                import asyncio as _asyncio
+                # Use cached state (no new fetch — already fetched in gate above)
+                if self._news._state == SentimentState.CAUTION:
+                    from core.market.news_filter import NewsFilter
+                    eff = min(0.95, eff + NewsFilter.CAUTION_PENALTY)
+            except Exception:
+                pass
 
         return min(0.95, max(self.BASE_THRESHOLD, eff))
 
@@ -741,20 +553,6 @@ class FuturesTrader:
         self._cycles += 1
         logger.info(f"Cycle #{self._cycles} — {self.symbol}")
 
-        # ── Periodic clock resync (prevents -1021 after long runs) ───────
-        # load_time_difference() runs once at connect but Windows clocks drift.
-        # After ~60 minutes the stored offset becomes stale and -1021 errors
-        # reappear. Resyncing every 30 minutes keeps the offset fresh for the
-        # entire trading session without adding meaningful latency (one HTTP call).
-        try:
-            if not hasattr(self, '_last_time_sync'):
-                self._last_time_sync = 0.0
-            if time.monotonic() - self._last_time_sync > 1800:   # every 30 minutes
-                await self.exchange.resync_clock()
-                self._last_time_sync = time.monotonic()
-        except Exception as _te:
-            logger.warning(f"[TIME] Periodic resync failed (non-fatal): {_te}")
-
         try:
             # ── Market data ───────────────────────────────────────────────
             candles = await self.exchange.get_ohlcv(self.symbol, self.TIMEFRAME, limit=200)
@@ -843,8 +641,7 @@ class FuturesTrader:
             # ── Signal timing gate ────────────────────────────────────────
             first_cycle = (self._last_eval_time == 0.0)
             if not self._should_evaluate_signal(df_1m, force=first_cycle):
-                logger.info(f"[GATE] {self.symbol} — waiting for next eval window "
-                    f"| {self._bars_since_eval if hasattr(self, '_bars_since_eval') else '?'}/{self.EVAL_WINDOW_BARS if hasattr(self, 'EVAL_WINDOW_BARS') else '?'} bars")
+                logger.info(f"[GATE] {self.symbol} — waiting for next eval window")
                 if self._reporter and self._cycles % 3 == 0:  # log every ~15s not every 5s
                     price_str = ""
                     try:
@@ -873,12 +670,11 @@ class FuturesTrader:
             if "adx" in df.columns:
                 adx_cur = float(df["adx"].dropna().iloc[-1]) if len(df["adx"].dropna()) > 0 else 0.0
 
-            # Gate 1: Only block extreme spikes (breakout/liquidation events)
-            # ATR_RATIO_MIN is no longer enforced here — the range_strategy
-            # handles quiet markets directly. Blocking them here would prevent
-            # range trades from ever firing.
+            # Gate 1: Absolute volatility bounds
             skip_reason = None
-            if atr_ratio > self.ATR_RATIO_MAX:
+            if atr_ratio < self.ATR_RATIO_MIN:
+                skip_reason = f"too quiet (ATR_ratio={atr_ratio:.2f} < {self.ATR_RATIO_MIN})"
+            elif atr_ratio > self.ATR_RATIO_MAX:
                 skip_reason = f"extreme spike (ATR_ratio={atr_ratio:.2f} > {self.ATR_RATIO_MAX}) — likely news/liquidation"
 
             # Gate 2: ADX floor — no trade in directionless markets
@@ -892,11 +688,20 @@ class FuturesTrader:
                     skip_reason = (f"no momentum (3-bar move={recent_move:.4f} < "
                                    f"{self.MIN_MOMENTUM_RATIO}×ATR={self.MIN_MOMENTUM_RATIO*atr_cur:.4f})")
 
+            # Gate 4: News/Sentiment filter
+            if skip_reason is None and self._news is not None:
+                try:
+                    import asyncio as _asyncio
+                    _news_task = _asyncio.ensure_future(self._news.get_state())
+                    news_state = await self._news.get_state()
+                    if news_state == SentimentState.AVOID:
+                        skip_reason = f"news-avoid ({self._news.last_reason})"
+                except Exception:
+                    pass  # never block trading on fetch failure
+
+
             if skip_reason:
-                logger.info(
-                    f"[SKIP:MARKET] {self.symbol} — {skip_reason} "
-                    f"| regime={regime_params.regime.value} ATR={atr_cur:.4f}"
-                )
+                logger.info(f"[SKIP:MARKET] {self.symbol} — {skip_reason}")
                 if self._reporter:
                     self._reporter.queue_log(
                         "info",
@@ -912,14 +717,6 @@ class FuturesTrader:
                 for d in ("long", "short"):
                     if self._direction_suppressed_bars.get(d, 0) > 0:
                         self._direction_suppressed_bars[d] -= 1
-
-            # ── Hot-swap: pick up any newly retrained model ─────────────
-            # auto_retrain.py saves ml_SYMBOL.joblib.pending when a new
-            # model passes quality gates. check_reload() atomically swaps
-            # it in so the bot uses the new model from the next prediction.
-            if hasattr(self.model, "ml") and hasattr(self.model.ml, "check_reload"):
-                if self.model.ml.check_reload():
-                    logger.info(f"[HOT-SWAP] {self.symbol}: new model active")
 
             # ── Signal evaluation ─────────────────────────────────────────
             prediction = self.model.predict(df, df_1h=df_1h)
@@ -938,127 +735,12 @@ class FuturesTrader:
             )
 
             if prediction.signal == Signal.HOLD:
-                logger.info(
-                    f"[HOLD] {self.symbol} — conf={prediction.confidence:.0%} "
-                    f"| regime={regime_params.regime.value} "
-                    f"| L={prediction.long_probability:.0%} S={prediction.short_probability:.0%}"
-                )
-                # Report HOLD to signals table for dashboard
-                if self._reporter:
-                    try:
-                        await self._reporter.report_signal(
-                            symbol          = self.symbol,
-                            signal          = "hold",
-                            confidence      = prediction.confidence,
-                            signal_type     = self._last_signal_type,
-                            regime          = self._last_regime,
-                            adx             = regime_params.adx if hasattr(regime_params, "adx") else None,
-                            atr_ratio       = atr_ratio,
-                            action_taken    = "hold",
-                            price_at_signal = current_price,
-                        )
-                    except Exception:
-                        pass
-
-                # ── RANGE STRATEGY on HOLD ────────────────────────────────
-                # ML sees no direction → try rule-based range setup
-                range_signal = self.range_strat.evaluate(
-                    df        = df,
-                    atr_ratio = atr_ratio,
-                    regime    = regime_params.regime.value,
-                )
-
-                if range_signal.has_signal:
-                    range_side = OrderSide.LONG if range_signal.is_long else OrderSide.SHORT
-                    logger.info(
-                        f"[RANGE] {self.symbol} {range_signal.direction} "
-                        f"(on ML HOLD) | quality={range_signal.quality:.2f}"
-                    )
-                    if self._reporter:
-                        await self._reporter.report_signal(
-                            symbol          = self.symbol,
-                            signal          = range_signal.direction.lower(),
-                            confidence      = range_signal.quality,
-                            signal_type     = "RANGE",
-                            regime          = regime_params.regime.value,
-                            adx             = regime_params.adx if hasattr(regime_params, "adx") else None,
-                            atr_ratio       = atr_ratio,
-                            action_taken    = "evaluating_range",
-                            price_at_signal = current_price,
-                        )
-                        self._reporter.queue_log(
-                            "info",
-                            f"📊 {self.symbol} — Range strategy: "
-                            f"{range_signal.direction} at band | "
-                            f"RSI={range_signal.rsi:.0f} Stoch={range_signal.stoch_k:.0f} | "
-                            f"quality={range_signal.quality:.0%}",
-                            channel="signal"
-                        )
-
-                    balance    = await self.exchange.get_balance()
-                    total_open = len(positions)
-
-                    if self.risk.is_daily_limit_hit(balance):
-                        return
-
-                    atr_val = float(df["atr"].iloc[-1]) if "atr" in df.columns else None
-
-                    range_trade_params = self.risk.calculate_trade(
-                        symbol       = self.symbol,
-                        side         = range_side,
-                        entry_price  = current_price,
-                        balance      = balance,
-                        open_trades  = total_open,
-                        atr          = atr_val,
-                        sl_atr_mult  = range_signal.sl_atr_mult,
-                        tp_atr_mult  = range_signal.tp_atr_mult,
-                        size_scale   = 0.75,
-                    )
-
-                    if not range_trade_params.approved:
-                        return
-
-                    if atr_cur > 0 and range_trade_params.quantity > 0:
-                        sl_dist_approx = abs(
-                            range_trade_params.entry_price - range_trade_params.stop_loss
-                        )
-                        expected_gross = (
-                            sl_dist_approx
-                            * range_trade_params.quantity
-                            * range_signal.tp_atr_mult
-                            / range_signal.sl_atr_mult
-                        )
-                        roundtrip_fee = (
-                            range_trade_params.entry_price
-                            * range_trade_params.quantity
-                            * self.TAKER_FEE_RATE
-                            * 2
-                        )
-                        net_tp_range = expected_gross - roundtrip_fee
-                        net_sl_range = sl_dist_approx * range_trade_params.quantity + roundtrip_fee
-                        net_rr_range = net_tp_range / net_sl_range if net_sl_range > 0 else 0
-                        if net_tp_range <= 0 or net_rr_range < 1.2:
-                            logger.info(
-                                f"[RANGE SKIP:PAYOFF] {self.symbol} — "
-                                f"net_RR={net_rr_range:.2f} < 1.2 after fees"
-                            )
-                            return
-
-                    logger.info(
-                        f"[RANGE EXECUTE] {self.symbol} {range_signal.direction} | "
-                        f"SL={range_trade_params.stop_loss:.4f} "
-                        f"TP={range_trade_params.take_profit:.4f}"
-                    )
-                    self.range_strat.record_trade()
-                    self._entry_confidence = range_signal.quality
-                    await self._execute_trade(range_trade_params)
-                    return
-
+                logger.info(f"[HOLD] {self.symbol}")
                 if self._reporter:
                     self._reporter.queue_log(
                         "info",
-                        f"🔍 {self.symbol} — No clear opportunity "
-                        f"(ML HOLD {prediction.confidence:.0%}, no range setup). Watching.",
+                        f"🔍 {self.symbol} — Analysed market. No clear trade opportunity right now "
+                        f"(confidence {prediction.confidence:.0%}, regime: {self._last_regime}). Watching.",
                         channel="signal"
                     )
                 return
@@ -1067,128 +749,18 @@ class FuturesTrader:
             eff_threshold = self._effective_threshold(regime_params, side)
 
             if prediction.confidence < eff_threshold:
-                recalib_adj_pct = self.recalibrator.get_threshold_adjustment(
-                    self.symbol, side.value)
-                regime_adj_pct  = regime_params.conf_thr_delta * 100
                 logger.info(
-                    f"[SKIP:CONF] {self.symbol} {side.value.upper()} — "
-                    f"conf={prediction.confidence:.2%} < thr={eff_threshold:.2%} "
-                    f"(base={self.BASE_THRESHOLD:.0%} recalib={recalib_adj_pct:+.1f}pp "
-                    f"regime={regime_adj_pct:+.1f}pp)"
+                    f"[SKIP:CONF] {self.symbol} — "
+                    f"conf={prediction.confidence:.2%} < threshold={eff_threshold:.2%}"
                 )
                 if self._reporter:
                     direction = "LONG 📈" if side == OrderSide.LONG else "SHORT 📉"
                     self._reporter.queue_log(
                         "info",
                         f"🔍 {self.symbol} — {direction} signal seen but confidence too low "
-                        f"({prediction.confidence:.1%} < required {eff_threshold:.1%}). "
-                        f"Checking range strategy...",
+                        f"({prediction.confidence:.1%} < required {eff_threshold:.1%}). Skipped.",
                         channel="signal"
                     )
-
-                # ── RANGE STRATEGY FALLBACK ───────────────────────────────
-                # When ML has no edge, evaluate rule-based mean-reversion.
-                # Fires at BB extremes confirmed by RSI + Stochastic.
-                # Only in RANGE/LOW_VOL regime (not during breakouts).
-                range_signal = self.range_strat.evaluate(
-                    df        = df,
-                    atr_ratio = atr_ratio,
-                    regime    = regime_params.regime.value,
-                )
-
-                if range_signal.has_signal:
-                    range_side = OrderSide.LONG if range_signal.is_long else OrderSide.SHORT
-                    logger.info(
-                        f"[RANGE] {self.symbol} {range_signal.direction} | "
-                        f"quality={range_signal.quality:.2f} | {range_signal.reason}"
-                    )
-
-                    # Report range signal to dashboard
-                    if self._reporter:
-                        await self._reporter.report_signal(
-                            symbol          = self.symbol,
-                            signal          = range_signal.direction.lower(),
-                            confidence      = range_signal.quality,
-                            signal_type     = "RANGE",
-                            regime          = regime_params.regime.value,
-                            adx             = regime_params.adx if hasattr(regime_params, "adx") else None,
-                            atr_ratio       = atr_ratio,
-                            action_taken    = "evaluating_range",
-                            price_at_signal = current_price,
-                        )
-                        self._reporter.queue_log(
-                            "info",
-                            f"📊 {self.symbol} — Range strategy: "
-                            f"{range_signal.direction} at band | "
-                            f"RSI={range_signal.rsi:.0f} Stoch={range_signal.stoch_k:.0f} | "
-                            f"quality={range_signal.quality:.0%}",
-                            channel="signal"
-                        )
-
-                    # Risk check
-                    balance    = await self.exchange.get_balance()
-                    total_open = len(positions)
-
-                    if self.risk.is_daily_limit_hit(balance):
-                        logger.warning(f"[DAILY LIMIT] {self.symbol} — range trade blocked")
-                        return
-
-                    atr_val = float(df["atr"].iloc[-1]) if "atr" in df.columns else None
-
-                    range_trade_params = self.risk.calculate_trade(
-                        symbol       = self.symbol,
-                        side         = range_side,
-                        entry_price  = current_price,
-                        balance      = balance,
-                        open_trades  = total_open,
-                        atr          = atr_val,
-                        sl_atr_mult  = range_signal.sl_atr_mult,
-                        tp_atr_mult  = range_signal.tp_atr_mult,
-                        size_scale   = 0.75,   # slightly smaller for range trades
-                    )
-
-                    if not range_trade_params.approved:
-                        logger.warning(
-                            f"[RANGE REJECTED] {self.symbol} — "
-                            f"{range_trade_params.reject_reason}"
-                        )
-                        return
-
-                    # Profitability gate — same as ML path
-                    if atr_cur > 0 and range_trade_params.quantity > 0:
-                        sl_dist_approx = abs(
-                            range_trade_params.entry_price - range_trade_params.stop_loss
-                        )
-                        expected_gross = (
-                            sl_dist_approx
-                            * range_trade_params.quantity
-                            * range_signal.tp_atr_mult
-                            / range_signal.sl_atr_mult
-                        )
-                        roundtrip_fee = (
-                            range_trade_params.entry_price
-                            * range_trade_params.quantity
-                            * self.TAKER_FEE_RATE
-                            * 2
-                        )
-                        if expected_gross < roundtrip_fee * self.MIN_FEE_MULTIPLE:
-                            logger.info(
-                                f"[RANGE SKIP:PAYOFF] {self.symbol} — "
-                                f"gross=${expected_gross:.4f} < "
-                                f"{self.MIN_FEE_MULTIPLE}×fee=${roundtrip_fee*self.MIN_FEE_MULTIPLE:.4f}"
-                            )
-                            return
-
-                    logger.info(
-                        f"[RANGE EXECUTE] {self.symbol} {range_signal.direction} | "
-                        f"SL={range_trade_params.stop_loss:.4f} "
-                        f"TP={range_trade_params.take_profit:.4f}"
-                    )
-                    self.range_strat.record_trade()
-                    self._entry_confidence = range_signal.quality
-                    await self._execute_trade(range_trade_params)
-                    return
-
                 return
 
             # ── AGREE filter (TRENDING only) ──────────────────────────────
@@ -1304,25 +876,18 @@ class FuturesTrader:
                 sl_dist_approx   = abs(trade_params.entry_price - trade_params.stop_loss)
                 expected_gross   = sl_dist_approx * trade_params.quantity * regime_params.tp_mult / regime_params.sl_mult
                 roundtrip_fee    = trade_params.entry_price * trade_params.quantity * self.TAKER_FEE_RATE * 2
-                # Fee-aware profitability gate:
-                # After fees, the net R:R must exceed 1.2 (trade needs meaningful edge)
-                net_tp = expected_gross - roundtrip_fee
-                net_sl = sl_dist_approx * trade_params.quantity + roundtrip_fee
-                net_rr = net_tp / net_sl if net_sl > 0 else 0
-                min_net_rr = 1.2  # minimum net R:R after fees
-
-                if net_tp <= 0 or net_rr < min_net_rr:
+                if expected_gross < roundtrip_fee * self.MIN_FEE_MULTIPLE:
                     logger.info(
-                        f"[SKIP:PAYOFF] {self.symbol} — "
-                        f"net_TP=${net_tp:.4f} net_RR={net_rr:.2f} < min {min_net_rr}. "
-                        f"Fee=${roundtrip_fee:.4f} eats too much of the edge."
+                        f"[SKIP:PAYOFF] {self.symbol} — expected_gross=${expected_gross:.4f} < "
+                        f"{self.MIN_FEE_MULTIPLE}×fee=${roundtrip_fee*self.MIN_FEE_MULTIPLE:.4f}. "
+                        f"Trade cannot net profit at this position size."
                     )
                     if self._reporter:
                         self._reporter.queue_log(
                             "info",
-                            f"📊 {self.symbol} — Trade skipped: net R:R after fees "
-                            f"({net_rr:.2f}) below minimum ({min_net_rr}). "
-                            f"Fee=${roundtrip_fee:.3f} vs gross TP=${expected_gross:.3f}.",
+                            f"📊 {self.symbol} — Trade skipped: expected payoff (${expected_gross:.2f}) "
+                            f"is too small relative to fees (${roundtrip_fee:.2f} roundtrip). "
+                            f"Increase position size or wait for higher-ATR conditions.",
                             channel="signal"
                         )
                     return

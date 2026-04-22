@@ -77,7 +77,6 @@ logger = get_logger(__name__)
 class Regime(str, Enum):
     TRENDING        = "TRENDING"
     RANGE           = "RANGE"
-    LOW_VOLATILITY  = "LOW_VOLATILITY"   # ATR < 65% of mean — range with micro moves
     HIGH_VOLATILITY = "HIGH_VOLATILITY"
 
 
@@ -125,38 +124,25 @@ class RegimeParams:
 # in 8 bars on a $93 asset. Kept at 1.2× (modest expansion only).
 _REGIME_PARAMS = {
     Regime.TRENDING: {
-        # Trending: no threshold boost — the user's base threshold is the filter.
-        # Previously +0.03 but combined with retrained model output (0.57-0.65)
-        # this blocked all trades. The user sets base_confidence in the dashboard;
-        # that IS the quality gate. Regime modifies SL/TP/size, not the gate itself.
-        "conf_adjustment":    0.00,    # no boost in TRENDING
+        # Trending: RAISE threshold — need conviction before trading in a trend.
+        # AGREE required (enforced in futures_trader.py, see TRENDING_REQUIRE_AGREE).
+        "conf_adjustment":    +0.03,   # higher threshold by 3pp (e.g. 0.42 → 0.45)
         "sl_mult_factor":      1.25,   # wider SL: 1.25× base (trend noise buffer)
         "tp_mult_factor":      1.20,   # modest TP expansion: 1.2× base only
         "position_size_scale": 0.80,   # slightly smaller size — trending = riskier
         "early_profit_r":      0.80,   # FIX: was 0.60 — higher floor so exit covers fees (need ~0.75R+ to net)
     },
     Regime.RANGE: {
-        # Range: small boost (+2pp) to prefer clearer signals in choppy markets.
-        # Was +0.05 but that blocked all trades. +0.02 adds mild preference for
-        # higher conviction without making range-market trading impossible.
-        "conf_adjustment":    +0.02,   # mild boost in RANGE (+2pp, was +5pp)
+        # Range: require stronger confirmation, take profit quickly
+        "conf_adjustment":    +0.02,   # lowered 5→2pp: in RANGE, model rarely exceeds 60% threshold; 2pp still filters noise
         "sl_mult_factor":      1.00,   # normal SL
         "tp_mult_factor":      1.00,   # normal TP — don't reach for large targets
         "position_size_scale": 1.00,   # normal size
-        "early_profit_r":      0.75,   # FIX: was 0.35 — raised to ensure gross > 2.5×fee before early exit
-    },
-    Regime.LOW_VOLATILITY: {
-        # Low vol / micro-range: tight SL, quick TP, full size
-        # The range_strategy handles entry logic; regime provides SL/TP scaling.
-        "conf_adjustment":    0.00,    # no threshold boost — range rules already filter
-        "sl_mult_factor":     0.80,    # tighter SL (0.8× base) — small moves, small risk
-        "tp_mult_factor":     1.20,    # moderate TP expansion
-        "position_size_scale": 1.00,   # full size — tight SL already limits risk
-        "early_profit_r":     0.60,    # take profit earlier in micro range
+        "early_profit_r":      1.10,   # raised 0.75→1.10: let trades run further before auto-exit; 1.10R ≈ 60% of way to TP
     },
     Regime.HIGH_VOLATILITY: {
-        # High vol: keep a moderate boost to prefer safer entries during spikes
-        "conf_adjustment":    +0.03,   # modest boost in HIGH_VOL (+3pp, was +5pp)
+        # High vol: widen SL to survive spikes, reduce size to limit loss
+        "conf_adjustment":    +0.05,   # also raise threshold in volatile market
         "sl_mult_factor":      1.40,   # much wider SL: 1.4× base
         "tp_mult_factor":      1.10,   # only slightly wider TP
         "position_size_scale": 0.50,   # 50% of normal size (was 60%)
@@ -164,18 +150,11 @@ _REGIME_PARAMS = {
     },
 }
 
-# TRENDING_REQUIRE_AGREE controls whether TRENDING regime requires both models
-# to agree before entering a trade.
-#
-# Previously True, but this combined with the removal of confidence scaling
-# made TRENDING effectively non-tradeable: the blended confidence ceiling
-# with raw (unscaled) outputs is ~0.77, and TRENDING threshold is 0.75.
-# An AGREE signal at ML=60% + TA=100% gives blended=0.74 — still below threshold.
-#
-# With require_agree=False, a SPLIT signal can trade if conf ≥ threshold (0.68-0.75).
-# The ML precision of 60% provides the same quality gate as AGREE did,
-# without requiring the coincidence of two independent models signaling together.
-TRENDING_REQUIRE_AGREE = False
+# In TRENDING regime, REQUIRE_AGREEMENT is enforced unconditionally regardless
+# of the trader's global REQUIRE_AGREEMENT setting. This prevents SPLIT signals
+# from slipping through just because ADX is high.
+# Set False only for research purposes.
+TRENDING_REQUIRE_AGREE = True
 
 # ── Detection thresholds ──────────────────────────────────────────────────────
 
@@ -236,9 +215,6 @@ class RegimeDetector:
             raw = Regime.TRENDING
         elif atr_ratio >= ATR_VOLATILITY_MULT:
             raw = Regime.HIGH_VOLATILITY
-        elif atr_ratio < 0.65:
-            # Below 65% of rolling ATR mean = distinctly quiet / micro-range
-            raw = Regime.LOW_VOLATILITY
         else:
             raw = Regime.RANGE
 

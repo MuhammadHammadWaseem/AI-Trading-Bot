@@ -32,6 +32,7 @@ from core.exchange.exchange_factory import create_exchange_from_config
 from core.risk.risk_manager import RiskManager
 from core.strategy.recovery_strategy import RecoveryStrategy
 from core.models.signal_recalibrator import SignalRecalibrator
+from core.market.news_filter import NewsFilter
 from config.settings import settings, RiskSettings
 from config.logger import get_logger
 
@@ -173,6 +174,9 @@ async def main():
         # the user configured in the dashboard. Now it reads from config JSON.
         base_threshold = config.get("base_confidence_threshold", None)
 
+        # Shared news filter — one singleton watches both sources for all symbols
+        news_filter = NewsFilter()
+
         trader = FuturesTrader(
             exchange          = exchange,
             symbol            = config["symbol"],
@@ -182,6 +186,7 @@ async def main():
             reporter          = reporter,
             stop_event        = stop_event,
             base_threshold    = base_threshold,   # ← FIX: user-defined min confidence
+            news_filter       = news_filter,       # shared NewsFilter singleton
         )
 
         # Log the effective threshold so the user can see it in the dashboard
