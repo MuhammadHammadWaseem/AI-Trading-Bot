@@ -28,11 +28,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.integrations.laravel_reporter import LaravelReporter
 from core.trader.futures_trader import FuturesTrader
-from core.exchange.exchange_factory import create_exchange_from_config
+from core.exchange.exchange_factory import create_exchange_from_config, validate_binance_keys
 from core.risk.risk_manager import RiskManager
 from core.strategy.recovery_strategy import RecoveryStrategy
 from core.models.signal_recalibrator import SignalRecalibrator
-from core.market.news_filter import NewsFilter
 from config.settings import settings, RiskSettings
 from config.logger import get_logger
 
@@ -137,11 +136,20 @@ async def main():
 
     try:
         # ── Exchange connection ─────────────────────────────────────────────
+        # ── Mode: paper vs live ─────────────────────────────────────────
+        trading_mode  = config.get("trading_mode", "paper")
+        paper_balance = float(config.get("paper_balance", 10_000.0))
+        if trading_mode == "live":
+            logger.warning(
+                f"[MANAGED] ⚠️  LIVE mode — real funds on the line. "
+                f"Double-check your risk settings before proceeding."
+            )
         exchange = await create_exchange_from_config(
             exchange_name = config.get("exchange", "binance"),
             api_key       = config["api_key"],
             api_secret    = config["api_secret"],
-            testnet       = config.get("is_testnet", True),
+            trading_mode  = trading_mode,
+            paper_balance = paper_balance,
         )
 
         ok = await exchange.connect()
@@ -163,6 +171,11 @@ async def main():
         )
         risk_manager = RiskManager(rs)
 
+        mode_label = "📄 PAPER" if trading_mode == "paper" else "💰 LIVE"
+        logger.info(f"[MANAGED] Trading mode: {mode_label}")
+        if trading_mode == "paper":
+            logger.info(f"[MANAGED] Paper balance: ${paper_balance:,.2f} USDT (virtual)")
+
         balance = await exchange.get_balance()
         risk_manager.set_session_balance(balance.total_balance)
         logger.info(f"[MANAGED] Account balance: {balance.total_balance:.2f} USDT")
@@ -174,9 +187,6 @@ async def main():
         # the user configured in the dashboard. Now it reads from config JSON.
         base_threshold = config.get("base_confidence_threshold", None)
 
-        # Shared news filter — one singleton watches both sources for all symbols
-        news_filter = NewsFilter()
-
         trader = FuturesTrader(
             exchange          = exchange,
             symbol            = config["symbol"],
@@ -186,7 +196,6 @@ async def main():
             reporter          = reporter,
             stop_event        = stop_event,
             base_threshold    = base_threshold,   # ← FIX: user-defined min confidence
-            news_filter       = news_filter,       # shared NewsFilter singleton
         )
 
         # Log the effective threshold so the user can see it in the dashboard

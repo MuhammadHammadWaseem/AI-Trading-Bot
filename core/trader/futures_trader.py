@@ -61,7 +61,6 @@ from core.models.hybrid_model import HybridModel
 from core.models.base_model import Signal
 from core.models.signal_recalibrator import SignalRecalibrator
 from core.risk.risk_manager import RiskManager, TradeParameters
-from core.market.news_filter import NewsFilter, SentimentState
 from core.market.regime_detector import RegimeDetector, Regime, RegimeParams
 from core.strategy.recovery_strategy import RecoveryStrategy
 from data.indicators import ohlcv_to_dataframe, add_all_indicators
@@ -108,7 +107,7 @@ class FuturesTrader:
     # ── Volatility / market readiness gates ──────────────────────────────
     ATR_RATIO_MIN  = 0.90   # current ATR must be >= 90% of rolling mean
     ATR_RATIO_MAX  = 2.50   # reject extreme spike volatility (news/liquidation)
-    ADX_MIN        = 14.0   # lowered 16→14: April 2026 low-vol market; BTC/ETH ADX 13-15
+    ADX_MIN        = 16.0   # minimum ADX for any trade — below = directionless
     # Minimum recent directional momentum: price must have moved at least this
     # fraction of ATR in the signal direction over the last 3 bars.
     MIN_MOMENTUM_RATIO = 0.25  # close[-1] vs close[-4] must be >= 0.25 × ATR
@@ -121,7 +120,9 @@ class FuturesTrader:
 
     # ── Confidence ────────────────────────────────────────────────────────
     BASE_THRESHOLD = 0.55
-    SPLIT_MIN_CONF = 0.52
+    SPLIT_MIN_CONF = 0.52   # legacy — not used directly
+    SPLIT_PENALTY  = 0.10   # DATA: SPLIT signals lost $1.60 of $2.18 total loss
+                             # +10pp penalty on top of normal threshold
     RECALIB_CAP    = 0.08
 
     # ── Directional loss streak suppression (Flaw 7) ─────────────────────
@@ -180,7 +181,7 @@ class FuturesTrader:
         daily_profit_target:   float = None,
         base_threshold:        float = None,
         timeframe:             str   = None,
-        news_filter:           object = None,  # NewsFilter shared instance
+        news_filter:           object = None,  # optional NewsFilter instance
         **kwargs,
     ):
         self.exchange     = exchange
@@ -188,7 +189,6 @@ class FuturesTrader:
         self.model        = HybridModel(symbol=symbol)
         self.regime       = RegimeDetector(symbol=symbol)
         self.recalibrator = recalibrator or SignalRecalibrator()
-        self._news        = news_filter  # optional shared NewsFilter (or None)
 
         # ── Auto-instantiate when not provided (managed mode) ─────────────
         self.recovery = recovery_strategy or RecoveryStrategy()
@@ -269,6 +269,7 @@ class FuturesTrader:
         self._last_5m_candle_ts: Optional[int]   = None
         self._last_eval_time:    float            = 0.0
         self._last_regime_params: Optional[RegimeParams] = None
+        self._news               = news_filter  # NewsFilter or None — used in _effective_threshold
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -279,7 +280,12 @@ class FuturesTrader:
                 return p
         return None
 
-    def _effective_threshold(self, regime_params: RegimeParams, side: OrderSide) -> float:
+    def _effective_threshold(
+        self,
+        regime_params: RegimeParams,
+        side: OrderSide,
+        signal_type: str = "AGREE",
+    ) -> float:
         """
         Compute the effective confidence threshold for this signal.
 
@@ -287,26 +293,29 @@ class FuturesTrader:
         BASE_THRESHOLD is set from the user's dashboard setting (base_confidence_threshold).
         Regime adjustments and recalibration can only RAISE the threshold above the
         user's minimum — they can never lower it below what the user configured.
-        This ensures the contract: 'I set 68%, no trade below 68%' is always honoured.
+
+        SPLIT PENALTY (data-driven, Apr 2026):
+        10 SPLIT signals → net -$1.60 loss. SPLIT means ema_L and ema_S disagree.
+        Adding +10pp penalty filters out the losers (conf 0.57-0.62) while
+        allowing the one SPLIT winner (conf=0.80) to pass at 0.80 > 0.65 threshold.
         """
         recalib_adj = self.recalibrator.get_threshold_adjustment(
             self.symbol, side.value) / 100.0
         recalib_adj = max(-self.RECALIB_CAP, min(self.RECALIB_CAP, recalib_adj))
 
         # Start from regime-adjusted threshold
-        # regime_params.conf_thr_delta is the regime adjustment delta (e.g. +0.02pp).
-        # It is already relative (not absolute), so add directly to BASE_THRESHOLD.
         eff = self.BASE_THRESHOLD + regime_params.conf_thr_delta + recalib_adj
 
-        # HARD FLOOR: never go below user's configured minimum, regardless of
-        # regime or recalibration adjustments.
+        # SPLIT penalty: model internal disagreement → require higher confidence
+        if signal_type == "SPLIT":
+            eff = eff + self.SPLIT_PENALTY
+
+        # HARD FLOOR: never go below user's configured minimum
         eff = max(eff, self.BASE_THRESHOLD)
 
         # News CAUTION: if sentiment is cautious, raise threshold by CAUTION_PENALTY
         if self._news is not None:
             try:
-                import asyncio as _asyncio
-                # Use cached state (no new fetch — already fetched in gate above)
                 if self._news._state == SentimentState.CAUTION:
                     from core.market.news_filter import NewsFilter
                     eff = min(0.95, eff + NewsFilter.CAUTION_PENALTY)
@@ -688,18 +697,6 @@ class FuturesTrader:
                     skip_reason = (f"no momentum (3-bar move={recent_move:.4f} < "
                                    f"{self.MIN_MOMENTUM_RATIO}×ATR={self.MIN_MOMENTUM_RATIO*atr_cur:.4f})")
 
-            # Gate 4: News/Sentiment filter
-            if skip_reason is None and self._news is not None:
-                try:
-                    import asyncio as _asyncio
-                    _news_task = _asyncio.ensure_future(self._news.get_state())
-                    news_state = await self._news.get_state()
-                    if news_state == SentimentState.AVOID:
-                        skip_reason = f"news-avoid ({self._news.last_reason})"
-                except Exception:
-                    pass  # never block trading on fetch failure
-
-
             if skip_reason:
                 logger.info(f"[SKIP:MARKET] {self.symbol} — {skip_reason}")
                 if self._reporter:
@@ -729,9 +726,10 @@ class FuturesTrader:
             self._last_signal_type = "AGREE" if "AGREE" in agreement else "SPLIT"
             self._last_regime      = regime_params.regime.value if regime_params else None
 
+            split_tag = " [SPLIT⚠]" if self._last_signal_type == "SPLIT" else ""
             logger.info(
                 f"[SIGNAL] {self.symbol} → {prediction.signal.value} | "
-                f"conf={prediction.confidence:.0%} | {prediction.source}"
+                f"conf={prediction.confidence:.0%} | {prediction.source}{split_tag}"
             )
 
             if prediction.signal == Signal.HOLD:
@@ -746,13 +744,23 @@ class FuturesTrader:
                 return
 
             side = OrderSide.LONG if prediction.signal == Signal.LONG else OrderSide.SHORT
-            eff_threshold = self._effective_threshold(regime_params, side)
+            eff_threshold = self._effective_threshold(
+                regime_params, side, self._last_signal_type or "AGREE"
+            )
 
             if prediction.confidence < eff_threshold:
-                logger.info(
-                    f"[SKIP:CONF] {self.symbol} — "
-                    f"conf={prediction.confidence:.2%} < threshold={eff_threshold:.2%}"
-                )
+                # Log SPLIT specifically so it's visible in dashboard logs
+                if self._last_signal_type == "SPLIT":
+                    logger.info(
+                        f"[SKIP:SPLIT] {self.symbol} — "
+                        f"conf={prediction.confidence:.2%} < SPLIT threshold={eff_threshold:.2%} "
+                        f"(base {self.BASE_THRESHOLD:.0%} + SPLIT penalty {self.SPLIT_PENALTY:.0%})"
+                    )
+                else:
+                    logger.info(
+                        f"[SKIP:CONF] {self.symbol} — "
+                        f"conf={prediction.confidence:.2%} < threshold={eff_threshold:.2%}"
+                    )
                 if self._reporter:
                     direction = "LONG 📈" if side == OrderSide.LONG else "SHORT 📉"
                     self._reporter.queue_log(
