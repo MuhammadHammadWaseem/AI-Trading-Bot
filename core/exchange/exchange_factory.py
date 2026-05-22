@@ -59,12 +59,13 @@ async def validate_binance_keys(api_key: str, api_secret: str) -> dict:
         "secret": api_secret,
         "options": {"defaultType": "future", "fetchCurrencies": False},
         "enableRateLimit": True,
+        "timeout": 30_000,
     })
 
     try:
         balance_data = await asyncio.wait_for(
             exchange.fetch_balance({"type": "future"}),
-            timeout=12,
+            timeout=30,
         )
         usdt = balance_data.get("USDT", {})
         result.update({
@@ -120,8 +121,9 @@ async def create_exchange_from_config(
     Paper mode intentionally permits missing/testnet keys because it never sends
     private exchange orders. Live mode remains strict and requires real keys.
     """
-    if exchange_name != "binance":
-        raise ValueError(f"Unsupported exchange '{exchange_name}'. Only 'binance' is implemented.")
+    exchange_name = (exchange_name or "binance").lower()
+    if exchange_name not in ("binance", "coinbase"):
+        raise ValueError(f"Unsupported exchange '{exchange_name}'. Supported exchanges: binance, coinbase.")
 
     if trading_mode not in ("paper", "live"):
         raise ValueError(f"Unknown trading_mode='{trading_mode}'. Use 'paper' or 'live'.")
@@ -137,6 +139,14 @@ async def create_exchange_from_config(
             f"(public market data, virtual orders, balance=${paper_balance:,.0f})"
         )
         return PaperExchange(credentials, initial_balance=paper_balance)
+
+    if exchange_name == "coinbase":
+        raise ValueError(
+            "Coinbase live order execution is not enabled in this bot yet. "
+            "Coinbase spot/Advanced Trade does not expose the same Binance USDM futures "
+            "contract used by this strategy (leverage, shorts, reduce-only position sync). "
+            "Use Binance for live mode or keep Coinbase bots in paper mode."
+        )
 
     if _looks_like_testnet_key(api_key) or _looks_like_testnet_key(api_secret):
         raise ValueError(_TESTNET_REJECTION_MSG)

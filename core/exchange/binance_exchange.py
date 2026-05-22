@@ -5,6 +5,7 @@ Binance USDM Futures - Testnet & Live support via ccxt.
 TP/SL handled via price monitoring (Testnet limitation workaround).
 """
 
+import asyncio
 import ccxt.async_support as ccxt
 from typing import Dict, List, Optional
 
@@ -26,6 +27,7 @@ def _normalize_symbol(symbol: str) -> str:
 class BinanceExchange(BaseExchange):
 
     TESTNET_BASE = "https://testnet.binancefuture.com"
+    REQUEST_TIMEOUT_MS = 30_000
 
     def __init__(self, credentials: ExchangeCredentials, public_only: bool = False):
         self.credentials = credentials
@@ -48,6 +50,7 @@ class BinanceExchange(BaseExchange):
                     "recvWindow": 10000,
                 },
                 "enableRateLimit": True,
+                "timeout": self.REQUEST_TIMEOUT_MS,
             }
 
             self._exchange = ccxt.binanceusdm(config)
@@ -65,10 +68,14 @@ class BinanceExchange(BaseExchange):
             # load_time_difference() measures the offset once and applies it to all
             # subsequent API calls — this is the primary fix for -1021 errors.
             try:
-                await self._exchange.load_time_difference()
+                await asyncio.wait_for(
+                    self._exchange.load_time_difference(),
+                    timeout=self.REQUEST_TIMEOUT_MS / 1000,
+                )
                 logger.info(f"[TIME] Clock synced with Binance server "
                             f"(offset={self._exchange.options.get('timeDifference', 0)}ms)")
             except Exception as te:
+                logger.warning(f"[TIME] Clock sync detail: {type(te).__name__}: {te}")
                 logger.warning(f"[TIME] Clock sync failed ({te}) — using recvWindow=10000ms fallback")
 
             if self.public_only:
@@ -76,7 +83,10 @@ class BinanceExchange(BaseExchange):
                 logger.info(f"[OK] Binance {mode} public market data connected")
                 return True
 
-            await self._exchange.fetch_balance({"type": "future"})
+            await asyncio.wait_for(
+                self._exchange.fetch_balance({"type": "future"}),
+                timeout=self.REQUEST_TIMEOUT_MS / 1000,
+            )
             mode = "TESTNET" if self.credentials.testnet else "LIVE"
             logger.info(f"[OK] Binance {mode} connected")
             return True
@@ -84,8 +94,25 @@ class BinanceExchange(BaseExchange):
         except ccxt.AuthenticationError as e:
             logger.error(f"[FAIL] Auth error - check API keys: {e}")
             return False
+        except (ccxt.RequestTimeout, asyncio.TimeoutError) as e:
+            logger.error(
+                "[FAIL] Binance Futures request timed out. Your machine/server cannot reliably reach "
+                "https://fapi.binance.com. Check firewall, VPN, region restrictions, DNS, or ISP/VPS blocking. "
+                f"Details: {type(e).__name__}: {e}"
+            )
+            return False
+        except ccxt.ExchangeNotAvailable as e:
+            logger.error(
+                "[FAIL] Binance Futures endpoint is unavailable from this network. "
+                "Use a permitted server/network if Binance blocks your region or VPS. "
+                f"Details: {type(e).__name__}: {e}"
+            )
+            return False
+        except ccxt.NetworkError as e:
+            logger.error(f"[FAIL] Network error while connecting to Binance Futures ({type(e).__name__}): {e}")
+            return False
         except Exception as e:
-            logger.error(f"[FAIL] Connection error: {e}")
+            logger.error(f"[FAIL] Connection error ({type(e).__name__}): {e}")
             return False
 
     async def resync_clock(self) -> int:
