@@ -119,6 +119,7 @@ class FuturesTrader:
     MIN_FEE_MULTIPLE   = 2.5   # expected_gross must be >= 2.5 × roundtrip_fee
 
     # ── Confidence ────────────────────────────────────────────────────────
+    MIN_NET_RR = 1.20
     BASE_THRESHOLD = 0.55
     SPLIT_MIN_CONF = 0.52   # legacy — not used directly
     SPLIT_PENALTY  = 0.10   # DATA: SPLIT signals lost $1.60 of $2.18 total loss
@@ -181,6 +182,7 @@ class FuturesTrader:
         daily_profit_target:   float = None,
         base_threshold:        float = None,
         timeframe:             str   = None,
+        max_trades_per_day:    int   = 0,
         news_filter:           object = None,  # optional NewsFilter instance
         **kwargs,
     ):
@@ -212,6 +214,7 @@ class FuturesTrader:
             self.BASE_THRESHOLD = base_threshold / 100.0 if base_threshold > 1 else base_threshold
         if timeframe is not None:
             self.TIMEFRAME = timeframe
+        self.max_trades_per_day = int(max_trades_per_day or 0)
 
         # Reporter + stop event (Laravel integration)
         self._reporter   = reporter
@@ -564,6 +567,11 @@ class FuturesTrader:
 
         try:
             # ── Market data ───────────────────────────────────────────────
+            try:
+                self.model.ml.check_reload()
+            except Exception:
+                pass
+
             candles = await self.exchange.get_ohlcv(self.symbol, self.TIMEFRAME, limit=200)
             if not candles or len(candles) < 50:
                 logger.warning(f"Insufficient candles for {self.symbol}")
@@ -631,6 +639,13 @@ class FuturesTrader:
                 return
 
             # ── No open position: cooldown → signals ──────────────────────
+
+            if self.max_trades_per_day and self._trades_opened >= self.max_trades_per_day:
+                logger.info(
+                    f"[DAILY TRADE LIMIT] {self.symbol} — "
+                    f"{self._trades_opened}/{self.max_trades_per_day} trades opened today"
+                )
+                return
 
             if self._cooldown_bars_remaining > 0:
                 if new_5m_candle:
@@ -896,6 +911,26 @@ class FuturesTrader:
                             f"📊 {self.symbol} — Trade skipped: expected payoff (${expected_gross:.2f}) "
                             f"is too small relative to fees (${roundtrip_fee:.2f} roundtrip). "
                             f"Increase position size or wait for higher-ATR conditions.",
+                            channel="signal"
+                        )
+                    return
+
+                gross_win = abs(trade_params.take_profit - trade_params.entry_price) * trade_params.quantity
+                gross_loss = abs(trade_params.entry_price - trade_params.stop_loss) * trade_params.quantity
+                net_win = gross_win - roundtrip_fee
+                net_loss = gross_loss + roundtrip_fee
+                net_rr = net_win / net_loss if net_loss > 0 else 0.0
+                if net_win <= 0 or net_rr < self.MIN_NET_RR:
+                    logger.info(
+                        f"[SKIP:NET_RR] {self.symbol} — net_win=${net_win:.4f}, "
+                        f"net_loss=${net_loss:.4f}, net_RR={net_rr:.2f} < {self.MIN_NET_RR:.2f}. "
+                        f"Fees make this setup structurally unattractive."
+                    )
+                    if self._reporter:
+                        self._reporter.queue_log(
+                            "info",
+                            f"Trade skipped: after fees, expected win/loss ratio is only {net_rr:.2f}. "
+                            f"Waiting for a cleaner setup.",
                             channel="signal"
                         )
                     return

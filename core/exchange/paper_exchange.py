@@ -68,8 +68,9 @@ class PaperExchange(BaseExchange):
         credentials: ExchangeCredentials,
         initial_balance: float = 10_000.0,
     ) -> None:
-        # Underlying real exchange — used for market data ONLY
-        self._real = BinanceExchange(credentials)
+        # Underlying exchange client: public market data only.
+        # Paper mode uses virtual orders and should not require real API keys.
+        self._real = BinanceExchange(credentials, public_only=True)
 
         # Virtual portfolio state
         self._initial_balance:  float = initial_balance

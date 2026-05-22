@@ -637,6 +637,7 @@ def train_symbol_from_history(symbol: str, dry_run: bool = False) -> dict:
     # ── Save model ────────────────────────────────────────────────────────────
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     model_path = MODELS_DIR / f"ml_{symbol}.joblib"
+    save_path = model_path if accepted else MODELS_DIR / f"ml_{symbol}.joblib.rejected"
 
     feature_names = feat_df.columns.tolist()
     joblib.dump({
@@ -651,14 +652,18 @@ def train_symbol_from_history(symbol: str, dry_run: bool = False) -> dict:
         "bars_trained":  n_samples,
         "date_range":    result["date_range"],
         "trained_at":    datetime.now().isoformat(),
-    }, model_path)
+    }, save_path)
 
-    status_str = "ACCEPTED" if accepted else "WF-rejected (saved anyway)"
+    status_str = "ACCEPTED" if accepted else "WF-rejected (not promoted)"
     print(f"\n  Saved → {model_path}")
+    print(f"  Active model path: {model_path if accepted else 'unchanged'}")
     if accepted:
         logger.info(f"[HIST] {symbol} ACCEPTED | Sharpe={mean_sharpe:.2f}  F1={mean_f1:.3f}")
     else:
-        logger.warning(f"[HIST] {symbol} WF-rejected | Sharpe={mean_sharpe:.2f}  F1={mean_f1:.3f} | saved anyway")
+        logger.warning(
+            f"[HIST] {symbol} WF-rejected | Sharpe={mean_sharpe:.2f}  F1={mean_f1:.3f} | "
+            f"saved to {save_path.name}, active model left unchanged"
+        )
 
     result["status"]  = "OK"
     result["verdict"] = "ACCEPTED" if accepted else "WF-REJECTED"

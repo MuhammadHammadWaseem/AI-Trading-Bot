@@ -27,8 +27,9 @@ class BinanceExchange(BaseExchange):
 
     TESTNET_BASE = "https://testnet.binancefuture.com"
 
-    def __init__(self, credentials: ExchangeCredentials):
+    def __init__(self, credentials: ExchangeCredentials, public_only: bool = False):
         self.credentials = credentials
+        self.public_only = public_only
         self._exchange: Optional[ccxt.binanceusdm] = None
 
     async def connect(self) -> bool:
@@ -69,6 +70,11 @@ class BinanceExchange(BaseExchange):
                             f"(offset={self._exchange.options.get('timeDifference', 0)}ms)")
             except Exception as te:
                 logger.warning(f"[TIME] Clock sync failed ({te}) — using recvWindow=10000ms fallback")
+
+            if self.public_only:
+                mode = "TESTNET" if self.credentials.testnet else "LIVE"
+                logger.info(f"[OK] Binance {mode} public market data connected")
+                return True
 
             await self._exchange.fetch_balance({"type": "future"})
             mode = "TESTNET" if self.credentials.testnet else "LIVE"

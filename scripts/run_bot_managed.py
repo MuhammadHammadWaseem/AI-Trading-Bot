@@ -165,7 +165,7 @@ async def main():
             take_profit_pct      = config.get("take_profit_pct", settings.risk.take_profit_pct),
             stop_loss_pct        = config.get("stop_loss_pct",   settings.risk.stop_loss_pct),
             risk_per_trade_pct   = config["risk_per_trade"],
-            max_open_trades      = settings.risk.max_open_trades,
+            max_open_trades      = int(config.get("max_open_trades", settings.risk.max_open_trades)),
             max_daily_loss_pct   = settings.risk.max_daily_loss_pct,
             max_daily_loss_usdt  = config.get("daily_loss_limit", 0.0),
         )
@@ -196,6 +196,8 @@ async def main():
             reporter          = reporter,
             stop_event        = stop_event,
             base_threshold    = base_threshold,   # ← FIX: user-defined min confidence
+            timeframe         = config.get("timeframe", "5m"),
+            max_trades_per_day = int(config.get("max_trades_per_day", 0) or 0),
         )
 
         # Log the effective threshold so the user can see it in the dashboard

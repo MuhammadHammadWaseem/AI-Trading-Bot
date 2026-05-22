@@ -84,6 +84,7 @@ class SignalRecalibrator:
         self._log_path = (log_dir or Path("logs")) / "trade_journal.csv"
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_csv_header()
+        self._load_recent_csv()
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -193,6 +194,34 @@ class SignalRecalibrator:
                     "confidence", "pnl_usdt", "pnl_r",
                     "bars_held", "exit_reason", "regime",
                 ])
+
+    def _load_recent_csv(self):
+        try:
+            with open(self._log_path, "r", newline="") as f:
+                for row in csv.DictReader(f):
+                    symbol = row.get("symbol", "")
+                    side = (row.get("side", "") or "").lower()
+                    if not symbol or side not in ("long", "short"):
+                        continue
+                    if symbol not in self._windows:
+                        self._windows[symbol] = {
+                            "long": deque(maxlen=self.WINDOW_SIZE),
+                            "short": deque(maxlen=self.WINDOW_SIZE),
+                        }
+                    self._windows[symbol][side].append(TradeRecord(
+                        timestamp=row.get("timestamp", ""),
+                        symbol=symbol,
+                        side=side,
+                        won=str(row.get("won", "0")) in ("1", "true", "True"),
+                        confidence=float(row.get("confidence") or 0),
+                        pnl_usdt=float(row.get("pnl_usdt") or 0),
+                        pnl_r=float(row.get("pnl_r") or 0),
+                        bars_held=int(float(row.get("bars_held") or 0)),
+                        exit_reason=row.get("exit_reason", "UNKNOWN"),
+                        regime=row.get("regime", "UNKNOWN"),
+                    ))
+        except Exception as e:
+            logger.warning(f"CSV load error: {e}")
 
     def _append_csv(self, record: TradeRecord):
         try:
