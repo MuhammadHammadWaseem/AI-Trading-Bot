@@ -350,6 +350,55 @@ class RiskManager:
                                 f"SL too tight: sl_dist={sl_dist:.4f} < min={min_sl_dist:.4f} "
                                 f"({MIN_SL_PCT}% of entry). Risk of immediate noise stop-out.")
 
+        # Hard user risk cap based on actual stop-loss exposure.
+        remaining_daily_loss = None
+        if self.settings.max_daily_loss_usdt > 0:
+            remaining_daily_loss = max(
+                0.0,
+                self.settings.max_daily_loss_usdt - self._daily_loss_usdt,
+            )
+            if remaining_daily_loss <= 0:
+                return self._reject(symbol, side, entry_price, "Daily USDT loss limit hit")
+
+        allowed_trade_risk = risk_amount
+        if remaining_daily_loss is not None:
+            allowed_trade_risk = min(allowed_trade_risk, remaining_daily_loss)
+
+        if allowed_trade_risk <= 0:
+            return self._reject(symbol, side, entry_price, "Configured risk cap is 0")
+
+        actual_sl_risk = quantity * sl_dist
+        if actual_sl_risk > allowed_trade_risk:
+            precision = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
+            capped_qty = math.floor((allowed_trade_risk / sl_dist) / step) * step
+            capped_qty = round(capped_qty, precision)
+
+            if capped_qty <= 0:
+                return self._reject(
+                    symbol, side, entry_price,
+                    f"Configured risk cap ${allowed_trade_risk:.2f} is too small for "
+                    f"SL distance {sl_dist:.4f}"
+                )
+
+            capped_notional = capped_qty * entry_price
+            if capped_notional < MIN_BINANCE_NOTIONAL:
+                return self._reject(
+                    symbol, side, entry_price,
+                    f"Configured risk cap ${allowed_trade_risk:.2f} would require "
+                    f"notional ${capped_notional:.2f}, below exchange minimum "
+                    f"${MIN_BINANCE_NOTIONAL:.2f}. Add funds, raise risk limit, "
+                    f"or trade a symbol with smaller minimum requirements."
+                )
+
+            logger.warning(
+                f"[RISK_CAP] {symbol} - qty capped {quantity} -> {capped_qty} | "
+                f"SL risk ${actual_sl_risk:.2f} -> ${capped_qty * sl_dist:.2f} "
+                f"(limit ${allowed_trade_risk:.2f})"
+            )
+            quantity = capped_qty
+            actual_sl_risk = quantity * sl_dist
+            position_usdt = quantity * entry_price
+
         # ── Guard 3: Minimum R:R ratio ───────────────────────────────────
         # TP distance must be at least 1.0× the SL distance.
         # A lower ratio guarantees losses even with >50% win rate.
@@ -367,14 +416,14 @@ class RiskManager:
         logger.info(
             f"Trade: {symbol} {side.value.upper()} | qty={quantity} | lev={lev}x | "
             f"notional=${actual_notional_final:.2f}{notional_note} | "
-            f"TP={take_profit} SL={stop_loss} | R:R={actual_rr:.2f} | risk={risk_amount:.2f} USDT"
+            f"TP={take_profit} SL={stop_loss} | R:R={actual_rr:.2f} | risk={actual_sl_risk:.2f} USDT"
         )
 
         return TradeParameters(
             symbol=symbol, side=side, quantity=quantity,
             leverage=lev, entry_price=entry_price,
             take_profit=take_profit, stop_loss=stop_loss,
-            position_size_usdt=position_usdt, risk_amount_usdt=risk_amount,
+            position_size_usdt=quantity * entry_price, risk_amount_usdt=actual_sl_risk,
             approved=True,
         )
 

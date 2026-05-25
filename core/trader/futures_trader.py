@@ -290,42 +290,16 @@ class FuturesTrader:
         signal_type: str = "AGREE",
     ) -> float:
         """
-        Compute the effective confidence threshold for this signal.
+        Return the exact minimum confidence configured by the user.
 
-        USER THRESHOLD IS A HARD FLOOR:
-        BASE_THRESHOLD is set from the user's dashboard setting (base_confidence_threshold).
-        Regime adjustments and recalibration can only RAISE the threshold above the
-        user's minimum — they can never lower it below what the user configured.
-
-        SPLIT PENALTY (data-driven, Apr 2026):
-        10 SPLIT signals → net -$1.60 loss. SPLIT means ema_L and ema_S disagree.
-        Adding +10pp penalty filters out the losers (conf 0.57-0.62) while
-        allowing the one SPLIT winner (conf=0.80) to pass at 0.80 > 0.65 threshold.
+        Earlier versions treated the dashboard value as a base threshold and
+        then added hidden regime/recalibration/SPLIT penalties. That made a
+        user setting such as 65% become 78% at runtime. For a SaaS trading
+        product the configured limit must be the contract, so the trade gate
+        now compares model confidence against the user's value exactly.
         """
-        recalib_adj = self.recalibrator.get_threshold_adjustment(
-            self.symbol, side.value) / 100.0
-        recalib_adj = max(-self.RECALIB_CAP, min(self.RECALIB_CAP, recalib_adj))
+        return min(0.95, max(0.0, self.BASE_THRESHOLD))
 
-        # Start from regime-adjusted threshold
-        eff = self.BASE_THRESHOLD + regime_params.conf_thr_delta + recalib_adj
-
-        # SPLIT penalty: model internal disagreement → require higher confidence
-        if signal_type == "SPLIT":
-            eff = eff + self.SPLIT_PENALTY
-
-        # HARD FLOOR: never go below user's configured minimum
-        eff = max(eff, self.BASE_THRESHOLD)
-
-        # News CAUTION: if sentiment is cautious, raise threshold by CAUTION_PENALTY
-        if self._news is not None:
-            try:
-                if self._news._state == SentimentState.CAUTION:
-                    from core.market.news_filter import NewsFilter
-                    eff = min(0.95, eff + NewsFilter.CAUTION_PENALTY)
-            except Exception:
-                pass
-
-        return min(0.95, max(self.BASE_THRESHOLD, eff))
 
     def _should_evaluate_signal(self, df_1m, force: bool = False) -> bool:
         if force:
@@ -768,8 +742,7 @@ class FuturesTrader:
                 if self._last_signal_type == "SPLIT":
                     logger.info(
                         f"[SKIP:SPLIT] {self.symbol} — "
-                        f"conf={prediction.confidence:.2%} < SPLIT threshold={eff_threshold:.2%} "
-                        f"(base {self.BASE_THRESHOLD:.0%} + SPLIT penalty {self.SPLIT_PENALTY:.0%})"
+                        f"conf={prediction.confidence:.2%} < user threshold={eff_threshold:.2%}"
                     )
                 else:
                     logger.info(
