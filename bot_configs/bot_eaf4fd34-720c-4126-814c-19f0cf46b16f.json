@@ -1,0 +1,21 @@
+{
+  "bot_id": "eaf4fd34-720c-4126-814c-19f0cf46b16f",
+  "bot_token": "51c276d8328ce43525944f6c0216484c445cb8c0bdc7e2eecffd9d4f44d6f1cc",
+  "laravel_api_url": "http://127.0.0.1:3001/api/bot",
+  "symbol": "BTC/USDT",
+  "timeframe": "5m",
+  "leverage": 5,
+  "api_key": "EJglMHPAdK7on3pqWX5lgTsFdJc9zextYCyg4481kW6UPtup4aOepxkr8aw9D6mO",
+  "api_secret": "hhGx3rCB6TwYroWnjEqRrV8K2NELGfA6fwrJFWaCivAjgZ4h6M6IndSgMFfBiASb",
+  "exchange": "binance",
+  "is_testnet": false,
+  "trading_mode": "live",
+  "paper_balance": 10000,
+  "risk_per_trade": 5,
+  "daily_loss_limit": 50,
+  "take_profit_pct": 4,
+  "stop_loss_pct": 2,
+  "base_confidence_threshold": 65,
+  "max_open_trades": 2,
+  "max_trades_per_day": 10
+}

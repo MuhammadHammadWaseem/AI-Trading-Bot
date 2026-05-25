@@ -24,6 +24,14 @@ import signal
 import sys
 from pathlib import Path
 
+# Shared hosts often expose many CPU cores but enforce strict process/thread
+# limits. Cap BLAS/OpenMP before importing numpy/scipy/sklearn through the bot.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.integrations.laravel_reporter import LaravelReporter
