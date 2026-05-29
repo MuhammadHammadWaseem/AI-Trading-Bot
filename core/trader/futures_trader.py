@@ -120,6 +120,9 @@ class FuturesTrader:
 
     # ── Confidence ────────────────────────────────────────────────────────
     MIN_NET_RR = 1.20
+    EARLY_PROFIT_TRAILBACK_R = 0.35
+    EARLY_PROFIT_FLOOR_FACTOR = 0.70
+    EARLY_PROFIT_MIN_FLOOR_R = 0.50
     BASE_THRESHOLD = 0.55
     SPLIT_MIN_CONF = 0.52   # legacy — not used directly
     SPLIT_PENALTY  = 0.10   # DATA: SPLIT signals lost $1.60 of $2.18 total loss
@@ -241,6 +244,9 @@ class FuturesTrader:
         self._bars_held          = 0
         self._breakeven_moved    = False
         self._partial_exit_taken = False
+        self._early_profit_armed = False
+        self._early_profit_floor_r = 0.0
+        self._peak_r_since_early = 0.0
 
         # Last-seen unrealized PnL — used to estimate PnL on external close
         self._last_known_pnl: float = 0.0
@@ -1044,10 +1050,11 @@ class FuturesTrader:
                 result = await self.exchange.close_position_partial(
                     symbol=self.symbol, quantity=partial_qty
                 )
-                if result and result.success:
-                    self._sl_price           = entry + 0.0001 if side == OrderSide.LONG else entry - 0.0001
-                    self._partial_exit_taken = True
-                    self._breakeven_moved    = True
+            if result and result.success:
+                self._sl_price           = entry + 0.0001 if side == OrderSide.LONG else entry - 0.0001
+                self._partial_exit_taken = True
+                self._early_profit_armed = False
+                self._breakeven_moved    = True
                     # Accumulate the realized PnL from this partial close so the final
                     # close can report the true combined PnL (partial + remaining leg).
                     partial_realized = (
@@ -1084,12 +1091,38 @@ class FuturesTrader:
                         f"🛡️ {self.symbol} — Stop loss moved to breakeven at {new_sl:.4f}. Position is now risk-free.",
                         channel="trade")
 
-        # ── Early profit exit (Flaw 1 fix: fee-aware minimum gross) ────────
+        # ── Early profit lock / exit (fee-aware) ──────────────────────────
         early_r = regime_params.early_profit_r
+        regime_name = getattr(regime_params.regime, "value", str(regime_params.regime)).upper()
+
+        if self._early_profit_armed:
+            self._peak_r_since_early = max(self._peak_r_since_early, current_r)
+            pulled_back = (self._peak_r_since_early - current_r) >= self.EARLY_PROFIT_TRAILBACK_R
+            lost_floor = current_r <= self._early_profit_floor_r
+            if pulled_back or lost_floor:
+                logger.info(
+                    f"[EARLY LOCK EXIT] {self.symbol} R={current_r:+.2f} | "
+                    f"peak={self._peak_r_since_early:+.2f} floor={self._early_profit_floor_r:+.2f} "
+                    f"reason={'pullback' if pulled_back else 'floor'}"
+                )
+                if self._reporter:
+                    self._reporter.queue_log(
+                        "info",
+                        f"🔒 {self.symbol} — Protected early profit after pullback "
+                        f"(R={current_r:+.2f}, peak={self._peak_r_since_early:+.2f}). Closing before profit fades.",
+                        channel="trade"
+                    )
+                await asyncio.sleep(self.SETTLE_DELAY)
+                await self._close_with_retry(
+                    "EARLY_PROFIT_LOCK", pos.unrealized_pnl, current_r, regime_params, current_price
+                )
+                return
+
         if (
             self._bars_held >= self.MIN_HOLD_BARS
             and current_r >= early_r
             and not self._partial_exit_taken
+            and not self._early_profit_armed
         ):
             # Gate: only exit early if gross PnL is a meaningful multiple of fees.
             # Exiting at 0.35R with a gross of $0.37 and fee of $0.25 leaves $0.12
@@ -1098,10 +1131,29 @@ class FuturesTrader:
             current_gross      = abs(pos.unrealized_pnl) if pos.unrealized_pnl is not None else 0.0
             fee_multiple_gross = (current_gross / roundtrip_fee) if roundtrip_fee > 0 else 99.0
 
-            if fee_multiple_gross >= self.MIN_FEE_MULTIPLE:
+            if fee_multiple_gross >= self.MIN_FEE_MULTIPLE and regime_name == "TRENDING":
+                self._early_profit_armed = True
+                self._peak_r_since_early = current_r
+                self._early_profit_floor_r = max(
+                    self.EARLY_PROFIT_MIN_FLOOR_R,
+                    early_r * self.EARLY_PROFIT_FLOOR_FACTOR,
+                )
+                logger.info(
+                    f"[EARLY PROFIT LOCK] {self.symbol} R={current_r:+.2f} | "
+                    f"floor={self._early_profit_floor_r:+.2f} | TRENDING - riding toward TP."
+                )
+                if self._reporter:
+                    self._reporter.queue_log(
+                        "info",
+                        f"🔒 {self.symbol} — Early profit reached (R={current_r:+.2f}). "
+                        f"Trend still active, so holding for full TP while protecting profit.",
+                        channel="trade"
+                    )
+            elif fee_multiple_gross >= self.MIN_FEE_MULTIPLE:
                 logger.info(
                     f"[EARLY PROFIT] {self.symbol} R={current_r:+.2f} | "
-                    f"gross={current_gross:.4f} ({fee_multiple_gross:.1f}×fee) — exiting."
+                    f"gross={current_gross:.4f} ({fee_multiple_gross:.1f}×fee) | "
+                    f"regime={regime_name} — exiting."
                 )
                 await asyncio.sleep(self.SETTLE_DELAY)
                 await self._close_with_retry(
@@ -1199,6 +1251,9 @@ class FuturesTrader:
             self._bars_held           = 0
             self._breakeven_moved     = False
             self._partial_exit_taken  = False
+            self._early_profit_armed  = False
+            self._early_profit_floor_r = 0.0
+            self._peak_r_since_early  = 0.0
             self._last_known_pnl      = 0.0
             self._position_opened_at  = time.monotonic()
             # Freeze the original SL distance as the R-unit for this trade.
@@ -1470,6 +1525,9 @@ class FuturesTrader:
         self._bars_held            = 0
         self._breakeven_moved      = False
         self._partial_exit_taken   = False
+        self._early_profit_armed   = False
+        self._early_profit_floor_r = 0.0
+        self._peak_r_since_early   = 0.0
         self._last_known_pnl       = 0.0
         self._last_eval_time       = 0.0
         self._position_opened_at   = None
