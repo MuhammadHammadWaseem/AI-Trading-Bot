@@ -147,6 +147,15 @@ async def main():
         # ── Mode: paper vs live ─────────────────────────────────────────
         trading_mode  = config.get("trading_mode", "paper")
         paper_balance = float(config.get("paper_balance", 10_000.0))
+        configured_timeframe = config.get("timeframe", "5m")
+        if configured_timeframe != "5m":
+            _final_status = "error"
+            _final_message = (
+                "Unsupported timeframe. Current production model is trained only "
+                "on 5m candles with 1h context. Reconfigure this bot to 5m."
+            )
+            logger.critical(f"[MANAGED] {_final_message}")
+            return
         if trading_mode == "live":
             logger.warning(
                 f"[MANAGED] ⚠️  LIVE mode — real funds on the line. "
@@ -204,7 +213,7 @@ async def main():
             reporter          = reporter,
             stop_event        = stop_event,
             base_threshold    = base_threshold,   # ← FIX: user-defined min confidence
-            timeframe         = config.get("timeframe", "5m"),
+            timeframe         = configured_timeframe,
             max_trades_per_day = int(config.get("max_trades_per_day", 0) or 0),
         )
 
